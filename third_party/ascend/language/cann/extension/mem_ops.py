@@ -102,6 +102,14 @@ def index_put(
         print("IndexPut result:", dst) # ref:[[3.,4.], [0.,0.], [1.,2.], [0.,0.]]
     """
 
+    import warnings
+    warnings.warn(
+        "index_put() is deprecated and will be removed in a future release. "
+        "Use al.custom('__builtin_index_put', ...) or tl.store() with compile_mode='simd_simt' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
     def index_put_impl(
         ptr: tl.tensor,
         index: tl.tensor,

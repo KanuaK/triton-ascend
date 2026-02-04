@@ -9,12 +9,13 @@ def TritonToUnstructure : Pass<"triton-to-unstructure", "mlir::ModuleOp"> {
     let options = [
         Option<"forceScalarizeMode", "force-scalarize-mode", "bool", "false", 
            "Scalarize unstructured memory access even if structured dimensions are mixed.">,
-        Option<"compileOn91095", "compile-on-910-95", 
+        Option<"compileOn91095", "compile-on-910-95",
             "bool", /*default*/"false",
             "compile on 910_95">,
-        Option<"forceSimtTemplate", "force-simt-template", 
-            "bool", /*default*/"false",
-            "force to use simt template">
+        Option<"compileMode", "compile-mode",
+            "std::string", /*default*/"\"simd\"",
+            "Compilation mode: simd, simd_simt, simt_template. "
+            "simd_simt/simt_template marks unstructured access with attr instead of loop-based scalarization">
     ];
 }
 

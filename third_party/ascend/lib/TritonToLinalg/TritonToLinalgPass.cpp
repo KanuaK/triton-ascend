@@ -86,6 +86,7 @@ using namespace triton;
 int nd2nzFlag = 0;
 bool compileOn91095Flag = false;
 bool existDotFlag = false;
+ascend::CompileMode compileModeFlag = ascend::CompileMode::Simd;
 
 // Convert CustomOp after operand type converted,
 // for example tt.ptr converted to memref.
@@ -113,8 +114,8 @@ static bool isSIMTOp(Operation *op)
       triton::ascend::IndexPutOp,
       triton::ascend::GatherOutToUbOp,
       triton::ascend::ScatterUbToOutOp,
-      triton::ascend::IndirectLoadOp,
-      triton::ascend::IndirectStoreOp
+      triton::ascend::UnstructuredLoadOp,
+      triton::ascend::UnstructuredStoreOp
       >(op);
 }
 
@@ -634,12 +635,12 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   patterns.add<TTOpConverters::DotScaledConverter>(patterns.getContext());
   patterns.add<TTOpConverters::PtrToIntConverter>(patterns.getContext());
 
-  patterns.add<TTOpConverters::IndirectLoadConverter>(patterns.getContext());
-  patterns.add<TTOpConverters::IndirectStoreConverter>(patterns.getContext());
   patterns.add<TTOpConverters::GatherOutToUbConverter>(patterns.getContext());
   patterns.add<TTOpConverters::ScatterUbToOutConverter>(patterns.getContext());
   patterns.add<TTOpConverters::IndexSelectSimdConverter>(patterns.getContext());
   patterns.add<TTOpConverters::IndexPutConverter>(patterns.getContext());
+  patterns.add<TTOpConverters::UnstructuredLoadConverter>(patterns.getContext());
+  patterns.add<TTOpConverters::UnstructuredStoreConverter>(patterns.getContext());
   patterns.add<TTOpConverters::SortOpConverter>(patterns.getContext());
   patterns.add<TTOpConverters::FlipOpConverter>(patterns.getContext());
   patterns.add<TTOpConverters::GatherConverter>(patterns.getContext());
@@ -766,6 +767,7 @@ LogicalResult TritonToLinalgPass::processLegalStrideOperations(ModuleOp moduleOp
 
 void TritonToLinalgPass::runOnOperation() {
   compileOn91095Flag = this->compileOn91095;
+  compileModeFlag = ascend::parseCompileMode(this->compileMode);
 
   auto moduleOp = getOperation();
 
@@ -1119,11 +1121,13 @@ triton::createTritonToLinalgPass(bool globalKernel,
                                  bool namedOps,
                                  bool enableNd2nzOnVector,
                                  bool enableSelectAnalysis,
-                                 bool compileOn91095) {
+                                 bool compileOn91095,
+                                 const std::string &compileMode) {
   return std::make_unique<TritonToLinalgPass>(globalKernel, namedOps,
                                               enableNd2nzOnVector,
                                               enableSelectAnalysis,
-                                              compileOn91095);
+                                              compileOn91095,
+                                              compileMode);
 }
 
 std::unique_ptr<OperationPass<ModuleOp>> triton::createTritonToLinalgPass() {
