@@ -2666,6 +2666,8 @@ IndexPutConverter::matchAndRewrite(triton::ascend::IndexPutOp op, OpAdaptor adap
     auto valueTensorType = cast<RankedTensorType>(value.getType());
     auto valueShape = valueTensorType.getShape();
     int32_t dimVal = static_cast<int32_t>(dimDefOp.value());
+    assert(dimVal >= 0 && dimVal < static_cast<int32_t>(valueShape.size()) &&
+           "index_put dim out of value tensor rank");
 
     int32_t burstLenVal = 1;
     for (int i = dimVal + 1; i < static_cast<int>(valueShape.size()); ++i) {
@@ -2690,10 +2692,10 @@ IndexPutConverter::matchAndRewrite(triton::ascend::IndexPutOp op, OpAdaptor adap
       elemOffsets = rewriter.create<arith::MulIOp>(loc, index, burstLenSplat);
     }
 
-    // hfusion.scatter_store(base, indices, data, burst_len)
-    SmallVector<Value> operands = {ptr, elemOffsets, value, burstLen.getResult()};
-    rewriter.create<hfusion::ScatterStoreOp>(loc, TypeRange{}, operands,
-                                             SmallVector<NamedAttribute>{});
+    // hfusion.scatter_store DPS form: ins(indices, data, burst_len, [mask]) outs(base)
+    rewriter.create<hfusion::ScatterStoreOp>(
+        loc, TypeRange{}, elemOffsets, value, burstLen, /*mask=*/Value(), ptr,
+        hfusion::CacheModifierAttr{}, hfusion::EvictionPolicyAttr{});
     rewriter.eraseOp(op);
     return success();
   }

@@ -955,7 +955,23 @@ class NPUOptions:
     # disable simt fma optimization to get high precision
     disable_fma: bool = False
 
+    _VALID_COMPILE_MODES = (
+        "simd", "simd_simt", "simt_template", "unstructured_in_simt", "simt_only",
+    )
+
+    # Default dynamic UB allocation budget (bytes) on 910_95.
+    # Capped by UB capacity; values leave headroom for runtime's static UB usage.
+    _DEFAULT_SHARED_MEM_SIMT_ONLY = 122880  # 120 KiB — pure SIMT uses less UB per block
+    _DEFAULT_SHARED_MEM_OTHER = 221184      # 216 KiB — SIMD/mix can pack larger working sets
+
     def __post_init__(self):
+        # Reject conflicting deprecated flags before applying either of them.
+        if self.force_simt_template and self.force_simt_only:
+            raise ValueError(
+                "force_simt_template and force_simt_only are mutually exclusive; "
+                "use compile_mode='simt_template' or compile_mode='simt_only' instead."
+            )
+
         # Backward compatibility: force_simt_template / force_simt_only overrides compile_mode
         if self.force_simt_template:
             warnings.warn(
@@ -973,6 +989,13 @@ class NPUOptions:
             )
             object.__setattr__(self, "compile_mode", "simt_only")
 
+        # Validate compile_mode value (after deprecation flags are applied)
+        if self.compile_mode not in self._VALID_COMPILE_MODES:
+            raise ValueError(
+                f"compile_mode must be one of {self._VALID_COMPILE_MODES}, "
+                f"got {self.compile_mode!r}"
+            )
+
         # Parse compile_mode and set related fields
         if self.compile_mode == "simd":
             object.__setattr__(self, "parallel_mode", "simd")
@@ -988,11 +1011,11 @@ class NPUOptions:
             object.__setattr__(self, "force_simt_only", True)
             object.__setattr__(self, "parallel_mode", "simt")
 
-        if self.force_simt_only:
-            if self.shared_mem_dynamic_size is None:
-                object.__setattr__(self, "shared_mem_dynamic_size", 122880)
-        elif self.shared_mem_dynamic_size is None:
-            object.__setattr__(self, "shared_mem_dynamic_size", 221184)
+        if self.shared_mem_dynamic_size is None:
+            default_size = (self._DEFAULT_SHARED_MEM_SIMT_ONLY
+                            if self.force_simt_only
+                            else self._DEFAULT_SHARED_MEM_OTHER)
+            object.__setattr__(self, "shared_mem_dynamic_size", default_size)
 
     def hash(self):
         key = "_".join([f"{name}-{val}" for name, val in self.__dict__.items()])

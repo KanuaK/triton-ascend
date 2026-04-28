@@ -340,7 +340,8 @@ def UnstructuredLoadOp : TT_Ascend_Op<"unstructured_load", [
 // Built-in: UnstructuredStore Op
 //
 def UnstructuredStoreOp : TT_Ascend_Op<"unstructured_store", [
-  MemoryEffects<[MemWrite<GlobalMemory>]>
+  MemoryEffects<[MemWrite<GlobalMemory>]>,
+  AttrSizedOperandSegments
 ]> {
   let summary = "Unstructured store with explicit base pointer and offset tensor";
 
