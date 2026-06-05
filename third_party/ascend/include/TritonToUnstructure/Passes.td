@@ -15,7 +15,10 @@ def TritonToUnstructure : Pass<"triton-to-unstructure", "mlir::ModuleOp"> {
         Option<"compileMode", "compile-mode",
             "std::string", /*default*/"\"simd\"",
             "Compilation mode: simd, simd_simt, simt_template. "
-            "simd_simt/simt_template marks unstructured access with attr instead of loop-based scalarization">
+            "simd_simt/simt_template marks unstructured access with attr instead of loop-based scalarization">,
+        Option<"forceSimtTemplate", "force-simt-template",
+            "bool", /*default*/"false",
+            "Deprecated alias for compile-mode=simt_template">
     ];
 }
 

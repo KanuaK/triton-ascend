@@ -679,13 +679,15 @@ TritonToUnstructurePass::TritonToUnstructurePass(
 
 void TritonToUnstructurePass::runOnOperation() {
   compileOn91095Flag = this->compileOn91095;
-  compileModeFlag = ascend::parseCompileMode(this->compileMode);
+  compileModeFlag =
+      ascend::resolveCompileMode(this->compileMode, this->forceSimtTemplate);
 
   LLVM_DEBUG({
     auto &os = llvm::dbgs();
     os << "TritonToUnstructurePass started with options:\n";
     os << "  compileOn91095: " << compileOn91095Flag << "\n";
     os << "  compileMode: " << this->compileMode << "\n";
+    os << "  forceSimtTemplate: " << this->forceSimtTemplate << "\n";
   });
 
   ModuleOp moduleOp = getOperation();

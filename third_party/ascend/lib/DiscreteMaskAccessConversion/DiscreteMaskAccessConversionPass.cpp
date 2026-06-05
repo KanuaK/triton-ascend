@@ -350,7 +350,8 @@ DiscreteMaskAccessConversionPass::DiscreteMaskAccessConversionPass(
 
 void DiscreteMaskAccessConversionPass::runOnOperation() {
   compileOn91095Flag = this->compileOn91095;
-  compileModeFlag = ascend::parseCompileMode(this->compileMode);
+  compileModeFlag =
+      ascend::resolveCompileMode(this->compileMode, this->forceSimtTemplate);
   enableSyncBlockLockFlag = this->enableSyncBlockLock;
 
   auto moduleOp = getOperation();

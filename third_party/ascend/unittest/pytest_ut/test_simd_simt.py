@@ -67,7 +67,7 @@ def test_indirect_index_load_div_kernel():
     print(f"Source data: [{src[0]}, {src[1]}, ..., {src[255]}]")
 
     indices = torch.tensor([10, 25, 100, 200, 5, 50, 150, 255], dtype=torch.int64, device='npu')
-    offset1 = torch.arange(8, dtype=torch.int64, device='npu')
+    offset1 = torch.arange(1, 9, dtype=torch.int64, device='npu')
     offset2 = torch.full((8, ), 3, dtype=torch.int64, device='npu')
     print(f"Indices: {indices.tolist()}")
 
@@ -687,28 +687,3 @@ def test_simple_indirect_store():
         torch.testing.assert_close(dst[p], values[i], rtol=1e-5, atol=1e-5)
 
     return True
-
-
-@simd_simt_910_95_only
-def test_simd_simt():
-    tests = [
-        test_simple_indirect_load_add, test_indirect_index_load_div_kernel, test_indirect_index_load_add_kernel,
-        test_indirect_index_load_and_kernel, test_indirect_index_load_max_min_kernel,
-        test_indirect_index_load_mul_kernel, test_indirect_index_load_or_kernel, test_indirect_index_load_sub_kernel,
-        test_simple_indirect_load_2d_min, test_simple_indirect_load_2d, test_simple_indirect_load, test_index_put,
-        test_index_select, test_simple_indirect_store
-    ]
-
-    for test in tests:
-        print(f"\nRunning {test.__name__}...")
-        try:
-            result = test()
-            if result:
-                print(f"{test.__name__} PASSED!")
-        except Exception as e:
-            print(f"{test.__name__} failed with error: {e}")
-            raise
-
-
-if __name__ == "__main__":
-    test_simd_simt()

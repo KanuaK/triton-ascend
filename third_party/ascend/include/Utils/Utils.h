@@ -64,6 +64,12 @@ inline CompileMode parseCompileMode(llvm::StringRef mode) {
       .Default(CompileMode::Simd);
 }
 
+/// Backward-compatible handling for the deprecated force-simt-template option.
+inline CompileMode resolveCompileMode(llvm::StringRef mode,
+                                      bool forceSimtTemplate) {
+  return forceSimtTemplate ? CompileMode::SimtTemplate : parseCompileMode(mode);
+}
+
 /// Returns true if the compile mode involves mixed SIMD/SIMT compilation.
 inline bool isMixCompileMode(CompileMode mode) {
   return mode == CompileMode::SimdSimt || mode == CompileMode::SimtTemplate;

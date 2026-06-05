@@ -26,7 +26,10 @@ def TritonToLinalg : Pass<"triton-to-linalg", "mlir::ModuleOp"> {
             "std::string", /*default*/"\"simd\"",
             "Compilation mode: simd, simd_simt, simt_template. "
             "simd_simt converts unstructured access to hfusion.gather_load/scatter_store; "
-            "simt_template converts to SIMT template calls">
+            "simt_template converts to SIMT template calls">,
+        Option<"forceSimtTemplate", "force-simt-template",
+            "bool", /*default*/"false",
+            "Deprecated alias for compile-mode=simt_template">
     ];
 }
 

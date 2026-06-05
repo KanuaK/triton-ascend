@@ -807,7 +807,8 @@ TritonToLinalgPass::processLegalStrideOperations(ModuleOp moduleOp) {
 
 void TritonToLinalgPass::runOnOperation() {
   compileOn91095Flag = this->compileOn91095;
-  compileModeFlag = ascend::parseCompileMode(this->compileMode);
+  compileModeFlag =
+      ascend::resolveCompileMode(this->compileMode, this->forceSimtTemplate);
 
   auto moduleOp = getOperation();
 
