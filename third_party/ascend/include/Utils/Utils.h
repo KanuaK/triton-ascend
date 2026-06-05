@@ -89,8 +89,8 @@ static constexpr unsigned kFuncNameCap = 128;
 
 /// Generate a unique function name within the given module by appending
 /// a numeric suffix if the base name already exists.
-inline llvm::SmallString<triton::ascend::kFuncNameCap> generateUniqueFuncName(
-    ModuleOp moduleOp, llvm::StringRef funcNameBase) {
+inline llvm::SmallString<triton::ascend::kFuncNameCap>
+generateUniqueFuncName(ModuleOp moduleOp, llvm::StringRef funcNameBase) {
   llvm::SmallString<triton::ascend::kFuncNameCap> funcName = funcNameBase;
   int uniqueId = 0;
   while (SymbolTable::lookupSymbolIn(moduleOp, funcName)) {

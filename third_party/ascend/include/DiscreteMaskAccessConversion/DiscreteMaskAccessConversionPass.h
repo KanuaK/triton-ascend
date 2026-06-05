@@ -26,8 +26,8 @@
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
-#include "mlir/IR/PatternMatch.h"
 #include "ascend/include/Utils/Utils.h"
+#include "mlir/IR/PatternMatch.h"
 
 #define GEN_PASS_DECL_DISCRETEMASKACCESSCONVERSION
 #include "ascend/include/DiscreteMaskAccessConversion/Passes.h.inc"

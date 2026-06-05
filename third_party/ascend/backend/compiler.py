@@ -128,41 +128,18 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             passes.common.add_cse(pm)
             passes.common.add_canonicalizer(pm)
 
-        ascend.passes.ttir.add_triton_to_structure(
-            pm,
-            enable_mask_fallback_conversion,
-            optimize_dynamic_offset
-        )
-        ascend.passes.ttir.add_discrete_mask_access_conversion(
-            pm,
-            compile_on_910_95,
-            compile_mode,
-            enable_sync_block_lock
-        )
+        ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
+        ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, compile_mode,
+                                                               enable_sync_block_lock)
         ascend.passes.ttir.add_triton_to_annotation(pm)
-        ascend.passes.ttir.add_triton_to_unstructure(
-            pm,
-            compile_on_910_95,
-            compile_mode
-        )
+        ascend.passes.ttir.add_triton_to_unstructure(pm, compile_on_910_95, compile_mode)
         ascend.passes.ttir.add_triton_to_hivm(pm)
         ascend.passes.ttir.add_triton_to_hfusion(pm)
         ascend.passes.ttir.add_triton_to_llvm(pm)
         ascend.passes.ttir.add_bubble_up_operation(pm)
-        ascend.passes.ttir.add_triton_to_structure(
-            pm,
-            enable_mask_fallback_conversion,
-            optimize_dynamic_offset
-        )
-        ascend.passes.ttir.add_triton_to_linalg(
-            pm,
-            False,
-            named_ops,
-            enable_nd2nz_on_vector,
-            enable_select_analysis,
-            compile_on_910_95,
-            compile_mode
-        )
+        ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
+        ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, enable_nd2nz_on_vector, enable_select_analysis,
+                                                compile_on_910_95, compile_mode)
         if metadata["enable_dynamic_cv_pipeline"]:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
 
@@ -560,11 +537,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             warp_size = metadata.get("warp_size", opt.warp_size)
             _compile_option_list += [f"--threads-per-warp={warp_size}"]
 
-        cmd_list = (
-            [npu_compiler_path, ttadapter_path]
-            + _compile_option_list
-            + ["-o", bin_file]
-        )
+        cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
         vf_merge_level = metadata["vf_merge_level"]
         if vf_merge_level is not None and vf_merge_level != 1:
             cmd_list += [f"--enable-vf-merge-level={vf_merge_level}"]
@@ -939,10 +912,8 @@ class NPUOptions:
             object.__setattr__(self, "parallel_mode", "simd")
         elif self.compile_mode in ("simd_simt", "simt_template", "unstructured_in_simt"):
             if not self.compile_on_910_95:
-                raise ValueError(
-                    f"compile_mode='{self.compile_mode}' is only supported on 910_95. "
-                    "A2/A3 targets do not support SIMT mix compile."
-                )
+                raise ValueError(f"compile_mode='{self.compile_mode}' is only supported on 910_95. "
+                                 "A2/A3 targets do not support SIMT mix compile.")
             if self.compile_mode == "simd_simt":
                 object.__setattr__(self, "parallel_mode", "mix_simd_simt")
         elif self.compile_mode == "simt_only":

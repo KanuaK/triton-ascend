@@ -182,26 +182,28 @@ void triton::UseAnalysis::visitOperation(Operation *op,
 
 void setMixUseRecursively(Operation *rootOp, bool applyRoot = true) {
   traverseBackwardUpdateOperandChainIf(
-    rootOp,
-    // ConditionFn
-    [rootOp, applyRoot](Operation *curOp) {
-      for (auto res : curOp->getResults()) {
-        auto tensorType = dyn_cast<RankedTensorType>(res.getType());
-        if (tensorType && isa<triton::PointerType>(tensorType.getElementType()))
-          return false;
-      }
-      return isMetaUse(curOp) && (curOp != rootOp || applyRoot);
-    },
-    // StopFn
-    [rootOp](Operation *curOp) {
-      return (isa<triton::LoadOp>(curOp) ||
-              isa<triton::ascend::UnstructuredLoadOp>(curOp)) && curOp != rootOp;
-    },
-    // ActionFn
-    [](OpBuilder &b, Operation *op) {
-      LLVM_DEBUG({ op->setAttr("MixUse", UnitAttr::get(b.getContext())); });
-      op->removeAttr("MetaUse");
-    });
+      rootOp,
+      // ConditionFn
+      [rootOp, applyRoot](Operation *curOp) {
+        for (auto res : curOp->getResults()) {
+          auto tensorType = dyn_cast<RankedTensorType>(res.getType());
+          if (tensorType &&
+              isa<triton::PointerType>(tensorType.getElementType()))
+            return false;
+        }
+        return isMetaUse(curOp) && (curOp != rootOp || applyRoot);
+      },
+      // StopFn
+      [rootOp](Operation *curOp) {
+        return (isa<triton::LoadOp>(curOp) ||
+                isa<triton::ascend::UnstructuredLoadOp>(curOp)) &&
+               curOp != rootOp;
+      },
+      // ActionFn
+      [](OpBuilder &b, Operation *op) {
+        LLVM_DEBUG({ op->setAttr("MixUse", UnitAttr::get(b.getContext())); });
+        op->removeAttr("MetaUse");
+      });
 }
 
 static void setMixUseFromValue(Value v) {
@@ -390,7 +392,8 @@ LogicalResult triton::runUseAnalysis(triton::FuncOp &funcOp) {
               auto indices = unstrucLoad.getIndices();
               auto mask = unstrucLoad.getMask();
               auto other = unstrucLoad.getOther();
-              if (result == base || result == indices || result == mask || result == other)
+              if (result == base || result == indices || result == mask ||
+                  result == other)
                 metaUsers.insert(user);
             })
             .Case<triton::StoreOp>([&](auto store) {
@@ -515,8 +518,8 @@ LogicalResult triton::runUseAnalysis(triton::FuncOp &funcOp) {
             // conversion.
             return (isa<triton::LoadOp>(curOp) || isa<triton::StoreOp>(curOp) ||
                     isa<triton::ascend::UnstructuredLoadOp>(curOp) ||
-                    isa<triton::ascend::UnstructuredStoreOp>(curOp))
-                    && !isMetaUse(curOp);
+                    isa<triton::ascend::UnstructuredStoreOp>(curOp)) &&
+                   !isMetaUse(curOp);
           },
           /*actionFn*/
           [](OpBuilder &b, Operation *op) { setMixUseRecursively(op); },

@@ -108,13 +108,10 @@ static bool isSIMTOp(Operation *op) {
     return custom_op.getCoreType() == hivm::TCoreType::VECTOR &&
            custom_op.getVFMode() == hivm::VFMode::SIMT;
   }
-  return isa<
-      triton::ascend::IndexPutOp,
-      triton::ascend::GatherOutToUbOp,
-      triton::ascend::ScatterUbToOutOp,
-      triton::ascend::UnstructuredLoadOp,
-      triton::ascend::UnstructuredStoreOp
-      >(op);
+  return isa<triton::ascend::IndexPutOp, triton::ascend::GatherOutToUbOp,
+             triton::ascend::ScatterUbToOutOp,
+             triton::ascend::UnstructuredLoadOp,
+             triton::ascend::UnstructuredStoreOp>(op);
 }
 
 TritonTypeConverter::TritonTypeConverter() {
@@ -660,8 +657,10 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   patterns.add<TTOpConverters::ScatterUbToOutConverter>(patterns.getContext());
   patterns.add<TTOpConverters::IndexSelectSimdConverter>(patterns.getContext());
   patterns.add<TTOpConverters::IndexPutConverter>(patterns.getContext());
-  patterns.add<TTOpConverters::UnstructuredLoadConverter>(patterns.getContext());
-  patterns.add<TTOpConverters::UnstructuredStoreConverter>(patterns.getContext());
+  patterns.add<TTOpConverters::UnstructuredLoadConverter>(
+      patterns.getContext());
+  patterns.add<TTOpConverters::UnstructuredStoreConverter>(
+      patterns.getContext());
   patterns.add<TTOpConverters::SortOpConverter>(patterns.getContext());
   patterns.add<TTOpConverters::FlipOpConverter>(patterns.getContext());
   patterns.add<TTOpConverters::GatherConverter>(patterns.getContext());
@@ -1175,17 +1174,13 @@ void TritonToLinalgPass::runOnOperation() {
 }
 
 std::unique_ptr<OperationPass<ModuleOp>>
-triton::createTritonToLinalgPass(bool globalKernel,
-                                 bool namedOps,
+triton::createTritonToLinalgPass(bool globalKernel, bool namedOps,
                                  bool enableNd2nzOnVector,
-                                 bool enableSelectAnalysis,
-                                 bool compileOn91095,
+                                 bool enableSelectAnalysis, bool compileOn91095,
                                  const std::string &compileMode) {
-  return std::make_unique<TritonToLinalgPass>(globalKernel, namedOps,
-                                              enableNd2nzOnVector,
-                                              enableSelectAnalysis,
-                                              compileOn91095,
-                                              compileMode);
+  return std::make_unique<TritonToLinalgPass>(
+      globalKernel, namedOps, enableNd2nzOnVector, enableSelectAnalysis,
+      compileOn91095, compileMode);
 }
 
 std::unique_ptr<OperationPass<ModuleOp>> triton::createTritonToLinalgPass() {

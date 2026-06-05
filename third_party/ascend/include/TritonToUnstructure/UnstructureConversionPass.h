@@ -28,8 +28,8 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "ascend/include/Dialect/TritonAscend/IR/TritonAscendDialect.h"
-#include "mlir/IR/PatternMatch.h"
 #include "ascend/include/Utils/Utils.h"
+#include "mlir/IR/PatternMatch.h"
 
 #define GEN_PASS_DECL_TRITONTOUNSTRUCTURE
 #include "ascend/include/TritonToUnstructure/Passes.h.inc"

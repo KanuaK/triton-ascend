@@ -354,33 +354,34 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
         [](mlir::PassManager &pm, bool globalKernel, bool namedOps,
            bool enableNd2nzOnVector, bool enableSelectAnalysis,
            bool compileOn91095, const std::string &compileMode) {
-    pm.addPass(mlir::triton::createTritonToLinalgPass(
-        globalKernel, namedOps, enableNd2nzOnVector, enableSelectAnalysis,
-        compileOn91095, compileMode));
-  });
+          pm.addPass(mlir::triton::createTritonToLinalgPass(
+              globalKernel, namedOps, enableNd2nzOnVector, enableSelectAnalysis,
+              compileOn91095, compileMode));
+        });
 
   m.def("add_triton_to_unstructure",
-        [](mlir::PassManager &pm, bool compileOn91095, const std::string &compileMode) {
-    TritonToUnstructureOptions opts;
-    opts.compileOn91095 = compileOn91095;
-    opts.compileMode = compileMode;
-    pm.addPass(mlir::triton::createTritonToUnstructurePass(opts));
-  });
+        [](mlir::PassManager &pm, bool compileOn91095,
+           const std::string &compileMode) {
+          TritonToUnstructureOptions opts;
+          opts.compileOn91095 = compileOn91095;
+          opts.compileMode = compileMode;
+          pm.addPass(mlir::triton::createTritonToUnstructurePass(opts));
+        });
 
   m.def("add_triton_to_hfusion", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createTritonToHFusionPass());
   });
 
-  m.def("add_discrete_mask_access_conversion", [](mlir::PassManager &pm,
-                                                  bool compileOn91095,
-                                                  const std::string &compileMode,
-                                                  bool enableSyncBlockLock) {
-    DiscreteMaskAccessConversionOptions opts;
-    opts.compileOn91095 = compileOn91095;
-    opts.compileMode = compileMode;
-    opts.enableSyncBlockLock = enableSyncBlockLock;
-    pm.addPass(mlir::triton::createDiscreteMaskAccessConversionPass(opts));
-  });
+  m.def("add_discrete_mask_access_conversion",
+        [](mlir::PassManager &pm, bool compileOn91095,
+           const std::string &compileMode, bool enableSyncBlockLock) {
+          DiscreteMaskAccessConversionOptions opts;
+          opts.compileOn91095 = compileOn91095;
+          opts.compileMode = compileMode;
+          opts.enableSyncBlockLock = enableSyncBlockLock;
+          pm.addPass(
+              mlir::triton::createDiscreteMaskAccessConversionPass(opts));
+        });
 
   m.def("add_triton_to_hivm", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createTritonToHIVMPass());

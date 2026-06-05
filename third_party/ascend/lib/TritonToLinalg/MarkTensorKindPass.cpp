@@ -144,16 +144,18 @@ void MarkTensorKindPass::runOnOperation() {
       MarkTensorKindPattern<TensorKind::INPUT,
                             triton::ascend::IndexSelectSimdOp>,
       MarkTensorKindPattern<TensorKind::INPUT, triton::ascend::GatherOutToUbOp>,
-      MarkTensorKindPattern<TensorKind::INPUT, triton::ascend::UnstructuredLoadOp>
-  >(&getContext());
+      MarkTensorKindPattern<TensorKind::INPUT,
+                            triton::ascend::UnstructuredLoadOp>>(&getContext());
 
   // OUTPUT tensors
   patterns.add<
       MarkTensorKindPattern<TensorKind::OUTPUT, triton::StoreOp>,
       MarkTensorKindPattern<TensorKind::OUTPUT, triton::ascend::IndexPutOp>,
-      MarkTensorKindPattern<TensorKind::OUTPUT, triton::ascend::ScatterUbToOutOp>,
-      MarkTensorKindPattern<TensorKind::OUTPUT, triton::ascend::UnstructuredStoreOp>
-  >(&getContext());
+      MarkTensorKindPattern<TensorKind::OUTPUT,
+                            triton::ascend::ScatterUbToOutOp>,
+      MarkTensorKindPattern<TensorKind::OUTPUT,
+                            triton::ascend::UnstructuredStoreOp>>(
+      &getContext());
 
   // INPUT_OUTPUT tensors
   patterns.add<

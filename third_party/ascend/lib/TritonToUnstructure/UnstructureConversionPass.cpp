@@ -260,8 +260,7 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
 
   bool hasMixCompileDiscreteMask =
       op->hasAttr(ConverterUtils::mixCompileDiscreteMaskAttrName);
-  if (!hasMixCompileDiscreteMask &&
-      ptrOffsetInfo.isStructured() &&
+  if (!hasMixCompileDiscreteMask && ptrOffsetInfo.isStructured() &&
       (!ptrOffsetInfo.isScalarLike() ||
        llvm::all_of(ptrType.getShape(), [](int64_t dim) { return dim == 1; })))
     return failure();
@@ -361,7 +360,7 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
     if (ascend::isMixCompileMode(compileModeFlag) &&
         (ptrOffsetInfo.hasUnstructuredDim() || hasMixCompileDiscreteMask)) {
       auto unstructuredDims = ptrOffsetInfo.getUnstructuredDims();
-      Value basePtr = ptrOffsetInfo.getPtr();       // scalar !tt.ptr<T>
+      Value basePtr = ptrOffsetInfo.getPtr();         // scalar !tt.ptr<T>
       Value offsetTensor = ptrOffsetInfo.getOffset(); // flat offset tensor
 
       assert(basePtr && "PtrOffsetInfo must provide a scalar base pointer");
@@ -369,24 +368,26 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
 
       if constexpr (std::is_same_v<MemAccOpTy, triton::LoadOp>) {
         auto resultType = op.getType();
-        auto unstrucLoadOp = rewriter.create<triton::ascend::UnstructuredLoadOp>(
-            loc, resultType, basePtr, offsetTensor,
-            rewriter.getDenseI64ArrayAttr(unstructuredDims),
-            op.getMask(), op.getOther(),
-            op.getCacheAttr(), op.getEvictAttr(), op.getIsVolatileAttr());
+        auto unstrucLoadOp =
+            rewriter.create<triton::ascend::UnstructuredLoadOp>(
+                loc, resultType, basePtr, offsetTensor,
+                rewriter.getDenseI64ArrayAttr(unstructuredDims), op.getMask(),
+                op.getOther(), op.getCacheAttr(), op.getEvictAttr(),
+                op.getIsVolatileAttr());
         rewriter.replaceOp(op, unstrucLoadOp.getResult());
       } else if constexpr (std::is_same_v<MemAccOpTy, triton::StoreOp>) {
         rewriter.create<triton::ascend::UnstructuredStoreOp>(
             loc, basePtr, offsetTensor, op.getValue(),
-            rewriter.getDenseI64ArrayAttr(unstructuredDims),
-            op.getMask(), op.getCacheAttr(), op.getEvictAttr());
+            rewriter.getDenseI64ArrayAttr(unstructuredDims), op.getMask(),
+            op.getCacheAttr(), op.getEvictAttr());
         rewriter.eraseOp(op);
       }
 
       LLVM_DEBUG({
         auto &os = llvm::dbgs();
         os << "Created UnstructuredLoad/StoreOp with dims: [";
-        for (auto d : unstructuredDims) os << d << " ";
+        for (auto d : unstructuredDims)
+          os << d << " ";
         os << "]\n";
       });
       return success();

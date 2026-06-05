@@ -23,12 +23,12 @@
 #ifndef TRITON_ADAPTER_CONVERSION_TRITONTOLINALG_H
 #define TRITON_ADAPTER_CONVERSION_TRITONTOLINALG_H
 
+#include "ascend/include/Utils/Utils.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
-#include "ascend/include/Utils/Utils.h"
 
 #define GEN_PASS_CLASSES
 #include "ascend/include/TritonToLinalg/Passes.h.inc"

@@ -133,7 +133,6 @@ bool getEnvBool(const char *envVar, bool defaultValue) {
   return true;
 }
 
-
 LogicalResult
 BitcastConverter::matchAndRewrite(triton::BitcastOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const {
@@ -2741,14 +2740,16 @@ IndexPutConverter::matchAndRewrite(triton::ascend::IndexPutOp op,
 
   bool isSimdSimtMode = (compileModeFlag == ascend::CompileMode::SimdSimt);
 
-  // Check if dim is a compile-time constant (required for static burstlen derivation).
-  // If not, fall back to template path even in simd_simt mode.
-  auto dimDefOp = isSimdSimtMode ? dim.getDefiningOp<arith::ConstantIntOp>() : nullptr;
+  // Check if dim is a compile-time constant (required for static burstlen
+  // derivation). If not, fall back to template path even in simd_simt mode.
+  auto dimDefOp =
+      isSimdSimtMode ? dim.getDefiningOp<arith::ConstantIntOp>() : nullptr;
   bool emitScatterStore = isSimdSimtMode && dimDefOp;
 
   if (emitScatterStore) {
     // simd_simt mode: generate hfusion.scatter_store with derived burstlen.
-    // burstlen = product of value.shape[j] for j > dim (contiguous elements per scatter).
+    // burstlen = product of value.shape[j] for j > dim (contiguous elements per
+    // scatter).
     auto valueTensorType = cast<RankedTensorType>(value.getType());
     auto valueShape = valueTensorType.getShape();
     int32_t dimVal = static_cast<int32_t>(dimDefOp.value());
@@ -2760,7 +2761,8 @@ IndexPutConverter::matchAndRewrite(triton::ascend::IndexPutOp op,
     }
     auto burstLen = rewriter.create<arith::ConstantIntOp>(loc, burstLenVal, 32);
 
-    // Convert row indices to element offsets: elem_offset[i] = index[i] * burstlen
+    // Convert row indices to element offsets: elem_offset[i] = index[i] *
+    // burstlen
     auto idxTensorType = cast<RankedTensorType>(index.getType());
     auto idxElemType = idxTensorType.getElementType();
     Value elemOffsets;
@@ -2777,7 +2779,8 @@ IndexPutConverter::matchAndRewrite(triton::ascend::IndexPutOp op,
     }
 
     // hfusion.scatter_store(base, indices, data, burst_len)
-    SmallVector<Value> operands = {ptr, elemOffsets, value, burstLen.getResult()};
+    SmallVector<Value> operands = {ptr, elemOffsets, value,
+                                   burstLen.getResult()};
     rewriter.create<hfusion::ScatterStoreOp>(loc, TypeRange{}, operands,
                                              SmallVector<NamedAttribute>{});
     rewriter.eraseOp(op);
@@ -2973,8 +2976,10 @@ LogicalResult UnstructuredLoadConverter::matchAndRewrite(
     auto funcName = generateUniqueFuncName(moduleOp, funcNameBase);
 
     SmallVector<Type> inputTypes({srcTy, offsets.getType()});
-    if (mask) inputTypes.push_back(mask.getType());
-    if (other) inputTypes.push_back(other.getType());
+    if (mask)
+      inputTypes.push_back(mask.getType());
+    if (other)
+      inputTypes.push_back(other.getType());
 
     auto libFnType = rewriter.getFunctionType(inputTypes, {resTy});
     auto funcOp = rewriter.create<func::FuncOp>(loc, funcName.str(), libFnType);
@@ -2982,8 +2987,10 @@ LogicalResult UnstructuredLoadConverter::matchAndRewrite(
 
     rewriter.setInsertionPoint(op);
     SmallVector<Value> inputVals({baseMem, offsets});
-    if (mask) inputVals.push_back(mask);
-    if (other) inputVals.push_back(other);
+    if (mask)
+      inputVals.push_back(mask);
+    if (other)
+      inputVals.push_back(other);
 
     auto callOp = rewriter.create<func::CallOp>(loc, funcOp.getSymNameAttr(),
                                                 TypeRange({resTy}), inputVals);
@@ -3035,7 +3042,8 @@ LogicalResult UnstructuredStoreConverter::matchAndRewrite(
     auto funcName = generateUniqueFuncName(moduleOp, funcNameBase);
 
     SmallVector<Type> inputTypes({srcTy, offsets.getType(), value.getType()});
-    if (mask) inputTypes.push_back(mask.getType());
+    if (mask)
+      inputTypes.push_back(mask.getType());
 
     auto libFnType = rewriter.getFunctionType(inputTypes, {});
     auto funcOp = rewriter.create<func::FuncOp>(loc, funcName.str(), libFnType);
@@ -3043,10 +3051,11 @@ LogicalResult UnstructuredStoreConverter::matchAndRewrite(
 
     rewriter.setInsertionPoint(op);
     SmallVector<Value> inputVals({baseMem, offsets, value});
-    if (mask) inputVals.push_back(mask);
+    if (mask)
+      inputVals.push_back(mask);
 
-    rewriter.create<func::CallOp>(loc, funcOp.getSymNameAttr(),
-                                  TypeRange{}, inputVals);
+    rewriter.create<func::CallOp>(loc, funcOp.getSymNameAttr(), TypeRange{},
+                                  inputVals);
     rewriter.eraseOp(op);
   }
   return success();

@@ -705,9 +705,11 @@ private:
   static constexpr llvm::StringRef funcNameBase = "triton_scatter_ub_to_out";
 };
 
-class UnstructuredLoadConverter : public OpConversionPattern<triton::ascend::UnstructuredLoadOp> {
+class UnstructuredLoadConverter
+    : public OpConversionPattern<triton::ascend::UnstructuredLoadOp> {
 public:
-  using OpConversionPattern<triton::ascend::UnstructuredLoadOp>::OpConversionPattern;
+  using OpConversionPattern<
+      triton::ascend::UnstructuredLoadOp>::OpConversionPattern;
   LogicalResult
   matchAndRewrite(triton::ascend::UnstructuredLoadOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override;
@@ -716,9 +718,11 @@ private:
   static constexpr llvm::StringRef funcNameBase = "triton_indirect_load";
 };
 
-class UnstructuredStoreConverter : public OpConversionPattern<triton::ascend::UnstructuredStoreOp> {
+class UnstructuredStoreConverter
+    : public OpConversionPattern<triton::ascend::UnstructuredStoreOp> {
 public:
-  using OpConversionPattern<triton::ascend::UnstructuredStoreOp>::OpConversionPattern;
+  using OpConversionPattern<
+      triton::ascend::UnstructuredStoreOp>::OpConversionPattern;
   LogicalResult
   matchAndRewrite(triton::ascend::UnstructuredStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override;

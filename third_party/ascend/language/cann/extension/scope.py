@@ -24,7 +24,6 @@ __all__ = ["scope"]
 
 from triton.language.core import _unwrap_if_constexpr
 
-
 _VALID_CORE_MODES = ("cube", "vector")
 _VALID_VEC_MODES = ("simd", "simt")
 
@@ -59,8 +58,7 @@ class scope:
             in pure simd / simt_only mode it is ignored.
     """
 
-    def __init__(self, core_mode: str = None, _builder=None, _semantic=None,
-                 vec_mode: str = None, **kwargs):
+    def __init__(self, core_mode: str = None, _builder=None, _semantic=None, vec_mode: str = None, **kwargs):
         """
         :param core_mode: Either "cube" or "vector" to specify the core type (optional)
         :param vec_mode: Vector core path selector within mix-compile modes:
@@ -77,19 +75,16 @@ class scope:
 
         # Validate core_mode
         if self.core_mode is not None and self.core_mode not in _VALID_CORE_MODES:
-            raise ValueError(
-                f'core_mode must be one of {_VALID_CORE_MODES}, got {self.core_mode!r}')
+            raise ValueError(f'core_mode must be one of {_VALID_CORE_MODES}, got {self.core_mode!r}')
 
         # Validate vec_mode
         if self.vec_mode is not None and self.vec_mode not in _VALID_VEC_MODES:
-            raise ValueError(
-                f'vec_mode must be one of {_VALID_VEC_MODES}, got {self.vec_mode!r}')
+            raise ValueError(f'vec_mode must be one of {_VALID_VEC_MODES}, got {self.vec_mode!r}')
 
         # vec_mode is a vector-core directive; reject when core_mode explicitly targets cube
         if self.core_mode == "cube" and self.vec_mode is not None:
-            raise ValueError(
-                'vec_mode cannot be set when core_mode="cube"; '
-                'vec_mode targets the vector core compile path')
+            raise ValueError('vec_mode cannot be set when core_mode="cube"; '
+                             'vec_mode targets the vector core compile path')
 
         # At least one of core_mode or vec_mode (or other kwargs) must be provided
         if self.core_mode is None and self.vec_mode is None and not kwargs:
