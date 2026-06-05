@@ -1,6 +1,11 @@
 import torch
+import pytest
 import triton
 import triton.language as tl
+from triton.tools.get_ascend_devices import is_compile_on_910_95
+
+simd_simt_910_95_only = pytest.mark.xfail(not is_compile_on_910_95,
+                                          reason="simd_simt compile mode only supports 910_95", run=False)
 
 
 @triton.jit
@@ -15,6 +20,7 @@ def simple_indirect_load_add_kernel(src_ptr, indices_ptr, out_ptr, add_value, BL
     tl.store(out_ptr + idx, value)
 
 
+@simd_simt_910_95_only
 def test_simple_indirect_load_add():
     src = torch.arange(256, dtype=torch.float32, device='npu')
     print(f"Source data: [{src[0]}, {src[1]}, ..., {src[255]}]")
@@ -54,6 +60,7 @@ def indirect_index_load_div_kernel(src_ptr, add_ptr, indices_ptr, out_ptr, offse
     tl.store(out_ptr + idx, value)
 
 
+@simd_simt_910_95_only
 def test_indirect_index_load_div_kernel():
     src = torch.arange(256, dtype=torch.float32, device='npu')
     add_src = torch.arange(8, dtype=torch.float32, device='npu')
@@ -94,6 +101,7 @@ def indirect_index_load_add_kernel(src_ptr, add_ptr, indices_ptr, out_ptr, BLOCK
     tl.store(out_ptr + idx, value)
 
 
+@simd_simt_910_95_only
 def test_indirect_index_load_add_kernel():
     src = torch.arange(256, dtype=torch.float32, device='npu')
     add_src = torch.arange(8, dtype=torch.float32, device='npu')
@@ -134,6 +142,7 @@ def indirect_index_load_and_kernel(src_ptr, add_ptr, indices_ptr, out_ptr, offse
     tl.store(out_ptr + idx, value)
 
 
+@simd_simt_910_95_only
 def test_indirect_index_load_and_kernel():
     src = torch.arange(256, dtype=torch.float32, device='npu')
     add_src = torch.arange(8, dtype=torch.float32, device='npu')
@@ -177,6 +186,7 @@ def indirect_index_load_max_min_kernel(src_ptr, add_ptr, indices_ptr, out_ptr, o
     tl.store(out_ptr + idx, value)
 
 
+@simd_simt_910_95_only
 def test_indirect_index_load_max_min_kernel():
     src = torch.arange(256, dtype=torch.float32, device='npu')
     add_src = torch.arange(8, dtype=torch.float32, device='npu')
@@ -221,6 +231,7 @@ def indirect_index_load_mul_kernel(src_ptr, add_ptr, indices_ptr, out_ptr, offse
     tl.store(out_ptr + idx, value)
 
 
+@simd_simt_910_95_only
 def test_indirect_index_load_mul_kernel():
     src = torch.arange(256, dtype=torch.float32, device='npu')
     add_src = torch.arange(8, dtype=torch.float32, device='npu')
@@ -264,6 +275,7 @@ def indirect_index_load_or_kernel(src_ptr, add_ptr, indices_ptr, out_ptr, offset
     tl.store(out_ptr + idx, value)
 
 
+@simd_simt_910_95_only
 def test_indirect_index_load_or_kernel():
     src = torch.arange(256, dtype=torch.float32, device='npu')
     add_src = torch.arange(8, dtype=torch.float32, device='npu')
@@ -307,6 +319,7 @@ def indirect_index_load_sub_kernel(src_ptr, add_ptr, indices_ptr, out_ptr, offse
     tl.store(out_ptr + idx, value)
 
 
+@simd_simt_910_95_only
 def test_indirect_index_load_sub_kernel():
     src = torch.arange(256, dtype=torch.float32, device='npu')
     add_src = torch.arange(8, dtype=torch.float32, device='npu')
@@ -350,6 +363,7 @@ def simple_indirect_load_2d_min_kernel(
     tl.store(out_ptr + offs_m * K + offs_k, values)
 
 
+@simd_simt_910_95_only
 def test_simple_indirect_load_2d_min():
     M, N = 4, 16
     K = 8
@@ -416,6 +430,7 @@ def simple_indirect_load_2d_kernel(
     tl.store(out_ptrs, values)
 
 
+@simd_simt_910_95_only
 def test_simple_indirect_load_2d():
     M, N = 4, 16
     K = 8
@@ -466,6 +481,7 @@ def simple_indirect_load_kernel(src_ptr, indices_ptr, out_ptr, BLOCK: tl.constex
     tl.store(out_ptr + idx, value)
 
 
+@simd_simt_910_95_only
 def test_simple_indirect_load():
     src = torch.arange(256, dtype=torch.float32, device='npu')
     print(f"Source data: [{src[0]}, {src[1]}, ..., {src[255]}]")
@@ -524,6 +540,7 @@ def index_put_kernel(
     tl.store(ptr, values)
 
 
+@simd_simt_910_95_only
 def test_index_put():
     N, D, M = 64, 32, 8
 
@@ -598,6 +615,7 @@ def index_select_kernel(
     tl.store(out_ptr + out_offsets, values)
 
 
+@simd_simt_910_95_only
 def test_index_select():
     N, D, M = 64, 32, 8
 
@@ -639,6 +657,7 @@ def simple_indirect_store_kernel(dst_ptr, indices_ptr, values_ptr, BLOCK: tl.con
     tl.store(dst_ptr + index, value)
 
 
+@simd_simt_910_95_only
 def test_simple_indirect_store():
     dst = torch.zeros(256, dtype=torch.float32, device='npu')
 
@@ -670,6 +689,7 @@ def test_simple_indirect_store():
     return True
 
 
+@simd_simt_910_95_only
 def test_simd_simt():
     tests = [
         test_simple_indirect_load_add, test_indirect_index_load_div_kernel, test_indirect_index_load_add_kernel,
