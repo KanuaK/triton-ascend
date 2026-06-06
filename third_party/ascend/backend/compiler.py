@@ -109,7 +109,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         enable_nd2nz_on_vector = metadata["enable_nd2nz_on_vector"]
         enable_select_analysis = metadata["enable_select_analysis"]
         compile_on_910_95 = metadata["compile_on_910_95"]
-        compile_mode = metadata.get("compile_mode", "simd")
+        compile_mode = _validate_compile_mode(metadata.get("compile_mode", "simd"))
         enable_sync_block_lock = metadata["enable_sync_block_lock"]
         enable_mask_fallback_conversion = metadata["enable_mask_fallback_conversion"]
         optimize_dynamic_offset = metadata["optimize_dynamic_offset"]
@@ -529,7 +529,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if opt.debug:
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
-        compile_mode = metadata.get("compile_mode", "simd")
+        compile_mode = _validate_compile_mode(metadata.get("compile_mode", "simd"))
         if compile_mode == "simd_simt":
             _compile_option_list += ["--enable-simd-simt-mix-compile"]
             num_warps = metadata.get("num_warps", opt.num_warps)
@@ -781,6 +781,16 @@ def get_libdevice():
     return os.path.join(current, "lib/libdevice.10.bc")
 
 
+VALID_COMPILE_MODES = ("simd", "simd_simt", "simt_template", "unstructured_in_simt", "simt_only")
+
+
+def _validate_compile_mode(compile_mode):
+    if compile_mode not in VALID_COMPILE_MODES:
+        valid_modes = ", ".join(VALID_COMPILE_MODES)
+        raise ValueError(f"Invalid compile_mode={compile_mode!r}. Expected one of: {valid_modes}.")
+    return compile_mode
+
+
 @dataclass(frozen=True)
 class NPUOptions:
     debug: bool = False
@@ -906,6 +916,8 @@ class NPUOptions:
                 stacklevel=2,
             )
             object.__setattr__(self, "compile_mode", "simt_only")
+
+        _validate_compile_mode(self.compile_mode)
 
         # Parse compile_mode and set related fields
         if self.compile_mode == "simd":

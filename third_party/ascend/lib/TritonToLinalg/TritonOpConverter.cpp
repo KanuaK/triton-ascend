@@ -2937,18 +2937,29 @@ LogicalResult UnstructuredLoadConverter::matchAndRewrite(
   // Compute burstlen from trailing structured dimensions.
   auto resultShape = cast<RankedTensorType>(resTy).getShape();
   int64_t burstlen = 1;
+  bool hasDynamicBurstlenDim = false;
+  auto updateBurstlen = [&](int64_t dim) {
+    if (ShapedType::isDynamic(dim)) {
+      hasDynamicBurstlenDim = true;
+      burstlen = 1;
+      return;
+    }
+    if (hasDynamicBurstlenDim)
+      return;
+    burstlen *= dim;
+  };
   if (unstrucDims.empty()) {
     for (int64_t dim : resultShape)
-      burstlen *= dim;
+      updateBurstlen(dim);
   } else {
     int64_t lastUnstrucDim =
         *std::max_element(unstrucDims.begin(), unstrucDims.end());
     for (int64_t j = lastUnstrucDim + 1; j < (int64_t)resultShape.size(); j++)
-      burstlen *= resultShape[j];
+      updateBurstlen(resultShape[j]);
   }
 
   // Check compile mode: hfusion gather_load vs simt_template func.call
-  bool isSimdSimtMode = (compileModeFlag == ascend::CompileMode::SimdSimt);
+  bool isSimdSimtMode = compileModeFlag == ascend::CompileMode::SimdSimt;
   if (isSimdSimtMode) {
     auto burstLen = rewriter.create<arith::ConstantIntOp>(loc, burstlen, 32);
 
@@ -3016,17 +3027,28 @@ LogicalResult UnstructuredStoreConverter::matchAndRewrite(
   // Compute burstlen from trailing structured dimensions.
   auto valueShape = cast<RankedTensorType>(value.getType()).getShape();
   int64_t burstlen = 1;
+  bool hasDynamicBurstlenDim = false;
+  auto updateBurstlen = [&](int64_t dim) {
+    if (ShapedType::isDynamic(dim)) {
+      hasDynamicBurstlenDim = true;
+      burstlen = 1;
+      return;
+    }
+    if (hasDynamicBurstlenDim)
+      return;
+    burstlen *= dim;
+  };
   if (unstrucDims.empty()) {
     for (int64_t dim : valueShape)
-      burstlen *= dim;
+      updateBurstlen(dim);
   } else {
     int64_t lastUnstrucDim =
         *std::max_element(unstrucDims.begin(), unstrucDims.end());
     for (int64_t j = lastUnstrucDim + 1; j < (int64_t)valueShape.size(); j++)
-      burstlen *= valueShape[j];
+      updateBurstlen(valueShape[j]);
   }
 
-  bool isSimdSimtMode = (compileModeFlag == ascend::CompileMode::SimdSimt);
+  bool isSimdSimtMode = compileModeFlag == ascend::CompileMode::SimdSimt;
 
   if (isSimdSimtMode) {
     auto burstLen = rewriter.create<arith::ConstantIntOp>(loc, burstlen, 32);
