@@ -129,9 +129,24 @@ NPU的 coreDim 参数不能超过 UINT16_MAX（65535）。当处理大规模数�
 解决思路1：  
 昇腾编译器针对coreDim超限问题，有对应的解决方案，只需将环境变量'TRITON_ALL_BLOCKS_PARALLEL'设为1。设置命令如下：  
 export TRITON_ALL_BLOCKS_PARALLEL=1  
-解决思路2：  
-通过增大 BLOCK_SIZE 来减少所需的核心数量，确保 coreDim 不超过限制。  
-计算公式： coreDim = ceil(N / BLOCK_SIZE) → 需满足：ceil(N / BLOCK_SIZE) <= 65535 => BLOCK_SIZE >= ceil(N / 65535) 代入 N = 1073741824 得： BLOCK_SIZE >= triton.next_power_of_2(triton.cdiv(1073741824, 65535)) = 32768 -> 至少为 32768更稳妥
+解决思路2：
+通过增大 BLOCK_SIZE 来减少所需的核心数量，确保 coreDim 不超过限制。
+计算公式如下：
+
+```text
+coreDim = ceil(N / BLOCK_SIZE)
+ceil(N / BLOCK_SIZE) <= 65535
+BLOCK_SIZE >= ceil(N / 65535)
+```
+
+代入 `N = 1073741824` 可得：
+
+```text
+ceil(1073741824 / 65535) = 16385
+triton.next_power_of_2(16385) = 32768
+```
+
+因此，如果 `BLOCK_SIZE` 按 2 的幂取值，至少应设置为 `32768`。
 
 优化前的代码：
 
