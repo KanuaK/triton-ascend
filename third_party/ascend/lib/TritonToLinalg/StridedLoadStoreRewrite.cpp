@@ -79,53 +79,6 @@ static bool isStaticConst(Value v) {
     return false;
 }
 
-static std::optional<int64_t> getStaticConstInt(Value v) {
-    IntegerAttr scalarAttr;
-    if (matchPattern(v, m_Constant(&scalarAttr)))
-        return scalarAttr.getValue().getSExtValue();
-    DenseElementsAttr denseAttr;
-    if (matchPattern(v, m_Constant(&denseAttr)) && denseAttr.isSplat() &&
-        denseAttr.getElementType().isInteger())
-        return denseAttr.getSplatValue<llvm::APInt>().getSExtValue();
-    if (auto splatOp = v.getDefiningOp<triton::SplatOp>())
-        return getStaticConstInt(splatOp.getSrc());
-    return std::nullopt;
-}
-
-static std::optional<int64_t> getStaticMaskUpperBound(Value mask) {
-    if (!mask)
-        return std::nullopt;
-    if (auto cmp = mask.getDefiningOp<arith::CmpIOp>()) {
-        auto bound = getStaticConstInt(cmp.getRhs());
-        if (!bound)
-            return std::nullopt;
-        if (cmp.getPredicate() == arith::CmpIPredicate::slt)
-            return *bound;
-        if (cmp.getPredicate() == arith::CmpIPredicate::sle)
-            return *bound + 1;
-        return std::nullopt;
-    }
-    if (auto andOp = mask.getDefiningOp<arith::AndIOp>()) {
-        auto lhsBound = getStaticMaskUpperBound(andOp.getLhs());
-        auto rhsBound = getStaticMaskUpperBound(andOp.getRhs());
-        if (lhsBound && rhsBound)
-            return std::min(*lhsBound, *rhsBound);
-        return lhsBound ? lhsBound : rhsBound;
-    }
-    return std::nullopt;
-}
-
-static bool shouldRouteMaskedSingleTilePow2ToIndirect(
-    Value mask, RankedTensorType tensorType) {
-    if (!mask || tensorType.getRank() != 1)
-        return false;
-    int64_t blockSize = tensorType.getShape()[0];
-    if (ShapedType::isDynamic(blockSize))
-        return false;
-    auto upperBound = getStaticMaskUpperBound(mask);
-    return upperBound && *upperBound <= blockSize;
-}
-
 // Lightweight pre-check: walks the offset's defining-op tree (bounded depth,
 // staying within tensor-typed values) looking for any arith.muli whose result
 // is a tensor and either one operand is a static constant with |c| > 1, or the
@@ -360,21 +313,16 @@ static LogicalResult tryRewriteAddPtrLoad(triton::LoadOp op,
     ptrState.analyzePermute();
     if (ptrState.isPermuted) return markInspectedAndReturn();
 
-    // Stride dispatch (mirrors tryRewriteBlockPtrLoad): DECLINE for most static
+    // Stride dispatch (mirrors tryRewriteBlockPtrLoad): only DECLINE for static
     // power-of-two strides (-> strided DMA / deinterleave); non-power-of-two
-    // static, dynamic, and masked single-tile pow2 strides fall through to SIMT
-    // indirect.
+    // static and dynamic strides fall through to SIMT indirect.
     auto lastStrideOpt = getConstantIntValue(ptrState.stateInfo.back().stride);
     int64_t lastStride = -1;  // -1 == dynamic
     if (lastStrideOpt.has_value()) {
         lastStride = std::abs(lastStrideOpt.value());
         if (lastStride <= 1) return markInspectedAndReturn();
-        bool routeMaskedPow2ToIndirect =
-            shouldRouteMaskedSingleTilePow2ToIndirect(op.getMask(), resultType);
-        if (lastStride == 2 && !routeMaskedPow2ToIndirect)
-            return markInspectedAndReturn();  // even -> deinterleave; odd -> strided DMA
-        if ((lastStride & (lastStride - 1)) == 0 &&
-            !routeMaskedPow2ToIndirect)
+        if (lastStride == 2) return markInspectedAndReturn();  // even -> deinterleave; odd -> strided DMA
+        if ((lastStride & (lastStride - 1)) == 0)
             return markInspectedAndReturn();  // power-of-two >= 4 -> strided DMA
     }
 
@@ -594,21 +542,16 @@ static LogicalResult tryRewriteAddPtrStore(triton::StoreOp op,
     ptrState.analyzePermute();
     if (ptrState.isPermuted) return markInspectedAndReturn();
 
-    // Stride dispatch (mirrors tryRewriteBlockPtrLoad): DECLINE for most static
+    // Stride dispatch (mirrors tryRewriteBlockPtrLoad): only DECLINE for static
     // power-of-two strides (-> strided DMA / deinterleave); non-power-of-two
-    // static, dynamic, and masked single-tile pow2 strides fall through to SIMT
-    // indirect.
+    // static and dynamic strides fall through to SIMT indirect.
     auto lastStrideOpt = getConstantIntValue(ptrState.stateInfo.back().stride);
     int64_t lastStride = -1;  // -1 == dynamic
     if (lastStrideOpt.has_value()) {
         lastStride = std::abs(lastStrideOpt.value());
         if (lastStride <= 1) return markInspectedAndReturn();
-        bool routeMaskedPow2ToIndirect =
-            shouldRouteMaskedSingleTilePow2ToIndirect(op.getMask(), valueType);
-        if (lastStride == 2 && !routeMaskedPow2ToIndirect)
-            return markInspectedAndReturn();  // even -> deinterleave; odd -> strided DMA
-        if ((lastStride & (lastStride - 1)) == 0 &&
-            !routeMaskedPow2ToIndirect)
+        if (lastStride == 2) return markInspectedAndReturn();  // even -> deinterleave; odd -> strided DMA
+        if ((lastStride & (lastStride - 1)) == 0)
             return markInspectedAndReturn();  // power-of-two >= 4 -> strided DMA
     }
 
