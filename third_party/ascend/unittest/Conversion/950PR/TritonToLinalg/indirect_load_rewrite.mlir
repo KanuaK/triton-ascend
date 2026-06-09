@@ -100,6 +100,30 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 }
 
 // -----
+// V2 rank-1 hit (AddPtr store, scalar base AddPtr + dynamic stride):
+// Fold the scalar base offset into the tensor offsets so indirect_store keeps
+// the original memref<?xf32> base instead of a size-1 reinterpret_cast view.
+// CHECK-LABEL: func.func @addptr_dynamic_stride_store_scalar_base
+// CHECK-NOT: memref<1xf32
+// CHECK: call @triton_indirect_store(%{{.*}}, %{{.*}}, %{{.*}}) : (memref<?xf32>, tensor<32xi64>, tensor<32xf32>) -> ()
+module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
+  tt.func public @addptr_dynamic_stride_store_scalar_base(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                                          %base_offset: i64,
+                                                          %stride: i64) {
+    %cst = arith.constant dense<1.000000e+00> : tensor<32xf32>
+    %range_i32 = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32>
+    %range_i64 = arith.extsi %range_i32 : tensor<32xi32> to tensor<32xi64>
+    %stride_splat = tt.splat %stride : i64 -> tensor<32xi64>
+    %offsets = arith.muli %range_i64, %stride_splat : tensor<32xi64>
+    %scalar_base = tt.addptr %arg0, %base_offset : !tt.ptr<f32>, i64
+    %base = tt.splat %scalar_base : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
+    %ptr = tt.addptr %base, %offsets : tensor<32x!tt.ptr<f32>>, tensor<32xi64>
+    tt.store %ptr, %cst : tensor<32x!tt.ptr<f32>>
+    tt.return
+  }
+}
+
+// -----
 // V1 miss (AddPtr, 1D, stride == 1):
 // arange + splat (no muli > 1) -> NOT rewritten, normal strided memref.copy
 // CHECK-LABEL: func.func @addptr_stride1_1d

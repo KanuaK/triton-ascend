@@ -226,6 +226,44 @@ static Value ensureI64Scalar(Value v, Location loc, PatternRewriter &rewriter) {
     return Value();  // Unsupported scalar type.
 }
 
+static LogicalResult unwrapScalarAddPtrChain(Value scalarPtr, Value &src,
+                                             Value &scalarOffset,
+                                             Location loc,
+                                             PatternRewriter &rewriter) {
+    src = scalarPtr;
+    scalarOffset = Value();
+    while (auto addPtrOp = src.getDefiningOp<triton::AddPtrOp>()) {
+        if (isa<RankedTensorType>(addPtrOp.getPtr().getType()))
+            break;
+        if (!scalarOffset)
+            scalarOffset = rewriter.create<arith::ConstantOp>(
+                loc, rewriter.getI64IntegerAttr(0));
+        Value offset = ensureI64Scalar(addPtrOp.getOffset(), loc, rewriter);
+        if (!offset)
+            return failure();
+        scalarOffset =
+            rewriter.create<arith::AddIOp>(loc, scalarOffset, offset);
+        src = addPtrOp.getPtr();
+    }
+    return success();
+}
+
+static Value addScalarOffsetToTensor(Value offsetTensor, Value scalarOffset,
+                                     Location loc,
+                                     PatternRewriter &rewriter) {
+    if (!scalarOffset)
+        return offsetTensor;
+    APInt scalarOffsetConst;
+    if (matchPattern(scalarOffset, m_ConstantInt(&scalarOffsetConst)) &&
+        scalarOffsetConst.isZero())
+        return offsetTensor;
+    auto tensorType = cast<RankedTensorType>(offsetTensor.getType());
+    Value scalarOffsetTensor =
+        rewriter.create<triton::SplatOp>(loc, tensorType, scalarOffset);
+    return rewriter.create<arith::AddIOp>(loc, offsetTensor,
+                                          scalarOffsetTensor);
+}
+
 // Expand a 1D tensor `v` of length `targetShape[axis]` into a rank-N tensor
 // with size `targetShape[axis]` at `axis` and size 1 elsewhere, then
 // broadcast to `targetShape`. Used to materialise the per-axis contribution
@@ -382,8 +420,16 @@ static LogicalResult tryRewriteAddPtrLoad(triton::LoadOp op,
         ensureI64OffsetTensor(addPtrOp.getOffset(), loc, rewriter);
     if (!offsetTensor) return failure();
 
+    Value src;
+    Value scalarOffset;
+    if (failed(unwrapScalarAddPtrChain(scalarBase, src, scalarOffset, loc,
+                                       rewriter)))
+        return markInspectedAndReturn();
+    offsetTensor =
+        addScalarOffsetToTensor(offsetTensor, scalarOffset, loc, rewriter);
+
     auto indirectLoad = rewriter.create<triton::ascend::IndirectLoadOp>(
-        loc, resultType, scalarBase, offsetTensor, op.getMask(), op.getOther());
+        loc, resultType, src, offsetTensor, op.getMask(), op.getOther());
     indirectLoad->setAttr(RewrittenByStridedLoadStoreRewriteTAG,
                           UnitAttr::get(rewriter.getContext()));
 
@@ -616,8 +662,16 @@ static LogicalResult tryRewriteAddPtrStore(triton::StoreOp op,
         ensureI64OffsetTensor(addPtrOp.getOffset(), loc, rewriter);
     if (!offsetTensor) return failure();
 
+    Value src;
+    Value scalarOffset;
+    if (failed(unwrapScalarAddPtrChain(scalarBase, src, scalarOffset, loc,
+                                       rewriter)))
+        return markInspectedAndReturn();
+    offsetTensor =
+        addScalarOffsetToTensor(offsetTensor, scalarOffset, loc, rewriter);
+
     auto indirectStore = rewriter.create<triton::ascend::IndirectStoreOp>(
-        loc, scalarBase, offsetTensor, op.getValue(), op.getMask());
+        loc, src, offsetTensor, op.getValue(), op.getMask());
     indirectStore->setAttr(RewrittenByStridedLoadStoreRewriteTAG,
                            UnitAttr::get(rewriter.getContext()));
 
