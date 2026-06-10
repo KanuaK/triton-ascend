@@ -922,21 +922,33 @@ class NPUOptions:
         # Parse compile_mode and set related fields
         if self.compile_mode == "simd":
             object.__setattr__(self, "parallel_mode", "simd")
-        elif self.compile_mode in ("simd_simt", "simt_template", "unstructured_in_simt"):
+            if self.shared_mem_dynamic_size is None:
+                object.__setattr__(self, "shared_mem_dynamic_size", 221184)
+        elif self.compile_mode == "simd_simt":
             if not self.compile_on_910_95:
                 raise ValueError(f"compile_mode='{self.compile_mode}' is only supported on 910_95. "
                                  "A2/A3 targets do not support SIMT mix compile.")
-            if self.compile_mode == "simd_simt":
-                object.__setattr__(self, "parallel_mode", "mix_simd_simt")
+            object.__setattr__(self, "parallel_mode", "mix_simd_simt")
+            if self.shared_mem_dynamic_size is None:
+                object.__setattr__(self, "shared_mem_dynamic_size", 221184)
+        elif self.compile_mode in ("simt_template", "unstructured_in_simt"):
+            if self.compile_mode == "unstructured_in_simt":
+                warnings.warn(
+                    "compile_mode='unstructured_in_simt' is deprecated, use compile_mode='simt_template' instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                object.__setattr__(self, "compile_mode", "simt_template")
+            if not self.compile_on_910_95:
+                raise ValueError(f"compile_mode='{self.compile_mode}' is only supported on 910_95. "
+                                 "A2/A3 targets do not support SIMT mix compile.")
+            if self.shared_mem_dynamic_size is None:
+                object.__setattr__(self, "shared_mem_dynamic_size", 221184)
         elif self.compile_mode == "simt_only":
             object.__setattr__(self, "force_simt_only", True)
             object.__setattr__(self, "parallel_mode", "simt")
-
-        if self.force_simt_only:
             if self.shared_mem_dynamic_size is None:
                 object.__setattr__(self, "shared_mem_dynamic_size", 122880)
-        elif self.shared_mem_dynamic_size is None:
-            object.__setattr__(self, "shared_mem_dynamic_size", 221184)
 
     def hash(self):
         key = "_".join([f"{name}-{val}" for name, val in self.__dict__.items()])
