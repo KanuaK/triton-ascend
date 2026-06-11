@@ -23,6 +23,7 @@
 #include "TritonToLinalg/StridedAxisCoalescing.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -106,6 +107,34 @@ static Value build2DBlockPtr(IRRewriter &rw, triton::MakeTensorPtrOp m1d,
     return p.getResult();
 }
 
+static Value stripIntCasts(Value v) {
+    while (true) {
+        if (auto e = v.getDefiningOp<arith::ExtSIOp>()) { v = e.getIn(); continue; }
+        if (auto t = v.getDefiningOp<arith::TruncIOp>()) { v = t.getIn(); continue; }
+        break;
+    }
+    return v;
+}
+
+static triton::GetProgramIdOp getIhPid(Value v, int64_t S) {
+    if (auto rem = v.getDefiningOp<arith::RemSIOp>()) {
+        APInt cC;
+        if (matchPattern(rem.getRhs(), m_ConstantInt(&cC)) &&
+            std::abs(cC.getSExtValue()) == S)
+            return stripIntCasts(rem.getLhs()).getDefiningOp<triton::GetProgramIdOp>();
+    }
+    return {};
+}
+
+static triton::AddPtrOp findIhAddPtrForAxis(Value base, int64_t S,
+                                            int32_t axis) {
+    triton::AddPtrOp ih = findIhAddPtr(base, S);
+    if (!ih) return {};
+    auto pid = getIhPid(ih.getOffset(), S);
+    if (!pid || pid.getAxisAsInt() != axis) return {};
+    return ih;
+}
+
 // Returns true if `op` (a tt.scan or tt.reduce) combines its two block args
 // with a single floating-point add (i.e. it is a sum / cumsum).
 static bool isPlusCombiner(Operation *op) {
@@ -184,6 +213,60 @@ static triton::ScanOp matchReverseCumsum(Value v, triton::StoreOp &storeOut,
     return scan;
 }
 
+// Detect the exclusive reverse-cumsum idiom:
+//   fwd = cumsum(v);  total = sum(v);  out = total - fwd
+// which is algebraically `reverse_cumsum(v) - v`. This is the backward variant
+// of the inclusive pattern above and likewise removes the tt.reduce before the
+// 2D coalescing lift.
+static triton::ScanOp
+matchExclusiveReverseCumsum(Value v, SmallVectorImpl<Operation *> &eraseList) {
+    triton::ScanOp scan;
+    triton::ReduceOp reduce;
+    for (Operation *u : v.getUsers()) {
+        if (auto s = dyn_cast<triton::ScanOp>(u)) {
+            if (scan) return {};
+            scan = s;
+        } else if (auto rd = dyn_cast<triton::ReduceOp>(u)) {
+            if (reduce) return {};
+            reduce = rd;
+        } else {
+            return {};
+        }
+    }
+    if (!scan || !reduce) return {};
+    if (scan.getReverse() || scan->getNumResults() != 1 || reduce->getNumResults() != 1)
+        return {};
+    if (!isPlusCombiner(scan) || !isPlusCombiner(reduce)) return {};
+
+    // scan -> subf(0, scan) -> add
+    Value scanRes = scan->getResult(0);
+    if (!scanRes.hasOneUse()) return {};
+    auto sub = dyn_cast<arith::SubFOp>(*scanRes.user_begin());
+    if (!sub || sub.getRhs() != scanRes) return {};
+    DenseElementsAttr zeroAttr;
+    if (!matchPattern(sub.getLhs(), m_Constant(&zeroAttr)) || !zeroAttr.isSplat() ||
+        !zeroAttr.getSplatValue<APFloat>().isZero())
+        return {};
+    if (!sub.getResult().hasOneUse()) return {};
+    auto add = dyn_cast<arith::AddFOp>(*sub.getResult().user_begin());
+    if (!add) return {};
+
+    // reduce -> splat -> add
+    Value redRes = reduce->getResult(0);
+    if (!redRes.hasOneUse()) return {};
+    auto splat = dyn_cast<triton::SplatOp>(*redRes.user_begin());
+    if (!splat || !splat.getResult().hasOneUse()) return {};
+    if (*splat.getResult().user_begin() != add.getOperation()) return {};
+
+    bool addOk = (add.getLhs() == sub.getResult() && add.getRhs() == splat.getResult()) ||
+                 (add.getRhs() == sub.getResult() && add.getLhs() == splat.getResult());
+    if (!addOk) return {};
+
+    eraseList.assign({add.getOperation(), sub.getOperation(), splat.getOperation(),
+                      reduce.getOperation(), scan.getOperation()});
+    return scan;
+}
+
 // Lift a rank-1 tensor type tensor<BTxe> to tensor<BTxSxe> (append the folded
 // H axis as the inner lane). Scalars / non-rank-1 types pass through unchanged.
 static Type lift2D(Type t, int64_t S) {
@@ -203,17 +286,42 @@ static bool is2DSafe(Operation *op) {
             arith::ExtFOp, arith::TruncFOp, arith::SIToFPOp, arith::UIToFPOp,
             arith::FPToSIOp, arith::FPToUIOp>(op))
         return true;
+    if (isa<math::ExpOp, math::LogOp>(op)) return true;
     if (isa<triton::SplatOp>(op)) return true;
     if (auto scan = dyn_cast<triton::ScanOp>(op))
         return scan.getAxis() == 0 && scan->getNumResults() == 1;
     return false;
 }
 
-// Phase 0: collapse the FLA reverse-cumsum idiom (forward scan + reduce + the
-// `-b_o + b_z + b_s` fixup, see matchReverseCumsum) into a single 1D reverse
-// scan. This removes the only shape-changing op (tt.reduce) so the remaining
-// load->store subgraph is pure elementwise/scan and Phase 1 can lift it
-// uniformly. Operates on 1D IR only.
+static bool dependsOnAxisPid(Value v, int32_t axis) {
+    DenseSet<Value> seen;
+    SmallVector<Value> wl{v};
+    while (!wl.empty()) {
+        Value cur = wl.pop_back_val();
+        if (!seen.insert(cur).second) continue;
+        Operation *def = cur.getDefiningOp();
+        if (!def) continue;
+        if (auto pid = dyn_cast<triton::GetProgramIdOp>(def))
+            if (pid.getAxisAsInt() == axis) return true;
+        for (Value operand : def->getOperands())
+            wl.push_back(operand);
+    }
+    return false;
+}
+
+static bool isLaneScalarElementwise(Operation *op) {
+    if (op->getNumResults() != 1 || isa<RankedTensorType>(op->getResult(0).getType()))
+        return false;
+    return isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
+               arith::NegFOp, arith::MaximumFOp, arith::MinimumFOp,
+               arith::MaxNumFOp, arith::MinNumFOp, arith::ExtFOp, arith::TruncFOp,
+               math::ExpOp, math::LogOp>(op);
+}
+
+// Phase 0: collapse the FLA reverse-cumsum idioms (forward scan + reduce) into
+// reverse scan form. This removes the only shape-changing op (tt.reduce) so the
+// remaining load->store subgraph is pure elementwise/scan and Phase 1 can lift
+// it uniformly. Operates on 1D IR only.
 static void simplifyReverseCumsum1D(ModuleOp moduleOp, int64_t S) {
     IRRewriter rw(moduleOp.getContext());
     SmallVector<triton::LoadOp> loads;
@@ -237,18 +345,38 @@ static void simplifyReverseCumsum1D(ModuleOp moduleOp, int64_t S) {
         triton::StoreOp st;
         SmallVector<Operation *> el;  // {a2, a1, sub, splat, reduce, scan}
         triton::ScanOp fwd = matchReverseCumsum(v, st, el);
-        if (!fwd) continue;
+        if (fwd) {
+            rw.setInsertionPoint(fwd);
+            auto rev = rw.create<triton::ScanOp>(fwd.getLoc(), ValueRange{v},
+                                                 static_cast<int>(fwd.getAxis()),
+                                                 /*reverse=*/true);
+            rw.cloneRegionBefore(fwd.getCombineOp(), rev.getCombineOp(),
+                                 rev.getCombineOp().end());
+            rw.replaceAllUsesWith(el.front()->getResult(0), rev->getResult(0));
+            for (Operation *o : el) {
+                assert(o->use_empty() && "reverse simplify: op still has uses");
+                rw.eraseOp(o);
+            }
+            continue;
+        }
 
-        rw.setInsertionPoint(fwd);
-        auto rev = rw.create<triton::ScanOp>(fwd.getLoc(), ValueRange{v},
-                                             static_cast<int>(fwd.getAxis()),
-                                             /*reverse=*/true);
-        rw.cloneRegionBefore(fwd.getCombineOp(), rev.getCombineOp(),
-                             rev.getCombineOp().end());
-        rw.replaceAllUsesWith(el.front()->getResult(0), rev->getResult(0));
-        for (Operation *o : el) {
-            assert(o->use_empty() && "reverse simplify: op still has uses");
-            rw.eraseOp(o);
+        el.clear();  // {add, sub, splat, reduce, scan}
+        fwd = matchExclusiveReverseCumsum(v, el);
+        if (fwd) {
+            rw.setInsertionPoint(fwd);
+            auto rev = rw.create<triton::ScanOp>(fwd.getLoc(), ValueRange{v},
+                                                 static_cast<int>(fwd.getAxis()),
+                                                 /*reverse=*/true);
+            rw.cloneRegionBefore(fwd.getCombineOp(), rev.getCombineOp(),
+                                 rev.getCombineOp().end());
+            rw.setInsertionPointAfter(rev);
+            Value exclusive = rw.create<arith::SubFOp>(
+                fwd.getLoc(), rev->getResult(0), v);
+            rw.replaceAllUsesWith(el.front()->getResult(0), exclusive);
+            for (Operation *o : el) {
+                assert(o->use_empty() && "exclusive reverse simplify: op still has uses");
+                rw.eraseOp(o);
+            }
         }
     }
 }
@@ -339,14 +467,92 @@ void rewriteStridedAxisCoalesce(ModuleOp moduleOp) {
     // Map each 1D value to its 2D counterpart, materializing splats/constants
     // on demand. Returns null to signal an un-liftable operand (bail).
     DenseMap<Value, Value> vmap;
+    auto liftLaneTy = [&](Type t) -> RankedTensorType {
+        return RankedTensorType::get({S}, t);
+    };
+    auto isLaneTensor = [&](Value v) {
+        auto rt = dyn_cast<RankedTensorType>(v.getType());
+        return rt && rt.getRank() == 1 && rt.getShape()[0] == S;
+    };
+    auto buildLaneLoad = [&](triton::LoadOp ld) -> Value {
+        if (isa<RankedTensorType>(ld.getResult().getType())) return Value();
+        if (ld.getMask() || ld.getOther() || !ld.getBoundaryCheck().empty())
+            return Value();
+        triton::AddPtrOp ih = findIhAddPtrForAxis(ld.getPtr(), S, coalesceAxis);
+        if (!ih || isa<RankedTensorType>(ih.getPtr().getType())) return Value();
+
+        auto offsetTy = dyn_cast<IntegerType>(ih.getOffset().getType());
+        if (!offsetTy || (offsetTy.getWidth() != 32 && offsetTy.getWidth() != 64))
+            return Value();
+
+        Location loc = ld.getLoc();
+        rw.setInsertionPoint(ld);
+        auto i32Ty = rw.getI32Type();
+        Value lane = rw.create<triton::MakeRangeOp>(
+            loc, RankedTensorType::get({S}, i32Ty), 0, S);
+        if (offsetTy.getWidth() == 64)
+            lane = rw.create<arith::ExtSIOp>(loc, liftLaneTy(offsetTy), lane);
+        Value base = rw.create<triton::SplatOp>(loc, liftLaneTy(ih.getPtr().getType()),
+                                                ih.getPtr());
+        Value lanePtr = rw.create<triton::AddPtrOp>(loc, base.getType(), base, lane);
+        auto n = rw.create<triton::LoadOp>(loc, lanePtr, ld.getCache(), ld.getEvict(),
+                                           ld.getIsVolatile());
+        vmap[ld.getResult()] = n.getResult();
+        return n.getResult();
+    };
     std::function<Value(Value)> get2D = [&](Value v) -> Value {
         auto it = vmap.find(v);
         if (it != vmap.end()) return it->second;
-        if (!isa<RankedTensorType>(v.getType())) return v;  // scalar, unchanged
+        if (!isa<RankedTensorType>(v.getType())) {
+            Operation *def = v.getDefiningOp();
+            if (auto ld = dyn_cast_or_null<triton::LoadOp>(def))
+                if (Value laneLoad = buildLaneLoad(ld)) return laneLoad;
+            if (def && isLaneScalarElementwise(def)) {
+                SmallVector<Value> rawOperands;
+                bool hasLaneOperand = false;
+                for (Value o : def->getOperands()) {
+                    Value n = get2D(o);
+                    if (!n) return Value();
+                    if (isa<RankedTensorType>(n.getType())) {
+                        if (!isLaneTensor(n)) return Value();
+                        hasLaneOperand = true;
+                    }
+                    rawOperands.push_back(n);
+                }
+                if (!hasLaneOperand) return v;  // scalar, unchanged
+                SmallVector<Value> operands;
+                for (Value n : rawOperands) {
+                    if (!isa<RankedTensorType>(n.getType())) {
+                        if (dependsOnAxisPid(n, coalesceAxis)) return Value();
+                        rw.setInsertionPoint(def);
+                        n = rw.create<triton::SplatOp>(def->getLoc(), liftLaneTy(n.getType()), n);
+                    }
+                    operands.push_back(n);
+                }
+                SmallVector<Type> resTypes{liftLaneTy(v.getType())};
+                rw.setInsertionPoint(def);
+                Operation *nu = rw.create(def->getLoc(), def->getName().getIdentifier(),
+                                          operands, resTypes, def->getAttrs());
+                vmap[v] = nu->getResult(0);
+                return nu->getResult(0);
+            }
+            return dependsOnAxisPid(v, coalesceAxis) ? Value() : v;
+        }
         if (auto sp = v.getDefiningOp<triton::SplatOp>()) {
+            Value src = get2D(sp.getSrc());
+            if (!src) return Value();
             rw.setInsertionPointAfter(sp);
-            Value n = rw.create<triton::SplatOp>(sp.getLoc(),
-                                                 lift2D(sp.getType(), S), sp.getSrc());
+            Value n;
+            if (!isa<RankedTensorType>(src.getType())) {
+                n = rw.create<triton::SplatOp>(sp.getLoc(), lift2D(sp.getType(), S),
+                                               src);
+            } else if (isLaneTensor(src)) {
+                Value cur = rw.create<triton::ExpandDimsOp>(sp.getLoc(), src, 0);
+                n = rw.create<triton::BroadcastOp>(sp.getLoc(), lift2D(sp.getType(), S),
+                                                   cur);
+            } else {
+                return Value();
+            }
             vmap[v] = n;
             return n;
         }
@@ -386,6 +592,7 @@ void rewriteStridedAxisCoalesce(ModuleOp moduleOp) {
         if (auto scan = dyn_cast<triton::ScanOp>(op)) {
             Value in = get2D(scan.getOperand(0));
             if (!in) return;
+            rw.setInsertionPoint(op);
             auto ns = rw.create<triton::ScanOp>(scan.getLoc(), ValueRange{in},
                                                 static_cast<int>(scan.getAxis()),
                                                 scan.getReverse());
@@ -400,6 +607,7 @@ void rewriteStridedAxisCoalesce(ModuleOp moduleOp) {
             if (!n) return;
             operands.push_back(n);
         }
+        rw.setInsertionPoint(op);
         OperationState st(op->getLoc(), op->getName());
         st.addOperands(operands);
         st.addAttributes(op->getAttrs());
