@@ -28,6 +28,7 @@
 #include "Dialect/TritonAscend/IR/TritonAscendDialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -114,9 +115,8 @@ static bool shouldRouteMaskedSingleTilePow2ToIndirect(
     return upperBound && *upperBound <= blockSize;
 }
 
-// Cheaply detect tensor-level static stride > 1 before running PtrAnalysis,
-// which mutates IR. Dynamic stride stays on the structured SIMD path, and
-// scalar offset arithmetic does not affect per-element stride.
+// Cheaply detect tensor-level static/dynamic stride before PtrAnalysis, which
+// mutates IR. Scalar offset arithmetic does not affect per-element stride.
 static bool offsetMayContainStrideGtOne(Value offset, int depthBudget = 16) {
     if (depthBudget <= 0) {
         return true;  // Give up cheaply and let PtrAnalysis decide downstream.
@@ -133,6 +133,9 @@ static bool offsetMayContainStrideGtOne(Value offset, int depthBudget = 16) {
             isStaticConstAbsGtOne(mul.getRhs())) {
             return true;
         }
+        if (!getStaticConstInt(mul.getLhs()).has_value() &&
+            !getStaticConstInt(mul.getRhs()).has_value())
+            return true;
         return offsetMayContainStrideGtOne(mul.getLhs(), depthBudget - 1) ||
                offsetMayContainStrideGtOne(mul.getRhs(), depthBudget - 1);
     }
@@ -150,6 +153,8 @@ static bool offsetMayContainStrideGtOne(Value offset, int depthBudget = 16) {
             denseAttr.getSplatValue<llvm::APInt>().getSExtValue() >= 1) {
             return true;
         }
+        if (!getStaticConstInt(shl.getRhs()).has_value())
+            return true;
         return offsetMayContainStrideGtOne(shl.getLhs(), depthBudget - 1);
     }
     for (Value operand : defOp->getOperands()) {
@@ -207,6 +212,30 @@ static Value ensureI64Scalar(Value v, Location loc, PatternRewriter &rewriter) {
     return Value();  // Unsupported scalar type.
 }
 
+static Value getDynamicStrideI64(OpFoldResult stride, Location loc,
+                                 PatternRewriter &rewriter) {
+    auto strideValue = dyn_cast<Value>(stride);
+    if (!strideValue)
+        return Value();
+    return ensureI64Scalar(strideValue, loc, rewriter);
+}
+
+static Value buildIsPositivePowerOfTwo(Value strideI64, Location loc,
+                                       PatternRewriter &rewriter) {
+    Value zero = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getI64IntegerAttr(0));
+    Value one = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getI64IntegerAttr(1));
+    Value positive = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::sgt, strideI64, zero);
+    Value strideMinusOne = rewriter.create<arith::SubIOp>(loc, strideI64, one);
+    Value lowBits = rewriter.create<arith::AndIOp>(loc, strideI64,
+                                                   strideMinusOne);
+    Value lowBitsZero = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::eq, lowBits, zero);
+    return rewriter.create<arith::AndIOp>(loc, positive, lowBitsZero);
+}
+
 static LogicalResult unwrapScalarAddPtrChain(Value scalarPtr, Value &src,
                                              Value &scalarOffset,
                                              Location loc,
@@ -243,6 +272,53 @@ static Value addScalarOffsetToTensor(Value offsetTensor, Value scalarOffset,
         rewriter.create<triton::SplatOp>(loc, tensorType, scalarOffset);
     return rewriter.create<arith::AddIOp>(loc, offsetTensor,
                                           scalarOffsetTensor);
+}
+
+static FailureOr<triton::ascend::IndirectLoadOp>
+emitAddPtrIndirectLoad(triton::LoadOp op, triton::AddPtrOp addPtrOp,
+                       Value scalarBase, RankedTensorType resultType,
+                       PatternRewriter &rewriter) {
+    auto loc = op.getLoc();
+    Value offsetTensor =
+        ensureI64OffsetTensor(addPtrOp.getOffset(), loc, rewriter);
+    if (!offsetTensor) return failure();
+
+    Value src;
+    Value scalarOffset;
+    if (failed(unwrapScalarAddPtrChain(scalarBase, src, scalarOffset, loc,
+                                       rewriter)))
+        return failure();
+    offsetTensor =
+        addScalarOffsetToTensor(offsetTensor, scalarOffset, loc, rewriter);
+
+    auto indirectLoad = rewriter.create<triton::ascend::IndirectLoadOp>(
+        loc, resultType, src, offsetTensor, op.getMask(), op.getOther());
+    indirectLoad->setAttr(RewrittenByStridedLoadStoreRewriteTAG,
+                          UnitAttr::get(rewriter.getContext()));
+    return indirectLoad;
+}
+
+static FailureOr<triton::ascend::IndirectStoreOp>
+emitAddPtrIndirectStore(triton::StoreOp op, triton::AddPtrOp addPtrOp,
+                        Value scalarBase, PatternRewriter &rewriter) {
+    auto loc = op.getLoc();
+    Value offsetTensor =
+        ensureI64OffsetTensor(addPtrOp.getOffset(), loc, rewriter);
+    if (!offsetTensor) return failure();
+
+    Value src;
+    Value scalarOffset;
+    if (failed(unwrapScalarAddPtrChain(scalarBase, src, scalarOffset, loc,
+                                       rewriter)))
+        return failure();
+    offsetTensor =
+        addScalarOffsetToTensor(offsetTensor, scalarOffset, loc, rewriter);
+
+    auto indirectStore = rewriter.create<triton::ascend::IndirectStoreOp>(
+        loc, src, offsetTensor, op.getValue(), op.getMask());
+    indirectStore->setAttr(RewrittenByStridedLoadStoreRewriteTAG,
+                           UnitAttr::get(rewriter.getContext()));
+    return indirectStore;
 }
 
 // Expand a 1D tensor `v` of length `targetShape[axis]` into a rank-N tensor
@@ -342,154 +418,27 @@ static Value buildPaddingOther(Location loc, PatternRewriter &rewriter,
     return rewriter.create<triton::SplatOp>(loc, resultType, padScalar);
 }
 
-// AddPtr path: tt.load(tt.addptr(tt.splat(%scalar_ptr), %offsets)).
-// Uses PtrAnalysis (which has IR side effects), so this function must
-// stamp InspectedByStridedLoadStoreRewriteTAG on every "PtrAnalysis ran but
-// don't rewrite" path -- see comment block inside.
-static LogicalResult tryRewriteAddPtrLoad(triton::LoadOp op,
-                                          triton::AddPtrOp addPtrOp,
-                                          RankedTensorType resultType,
-                                          PatternRewriter &rewriter) {
-    auto loc = op.getLoc();
-
-    // The base must resolve to a scalar pointer through shape-only wrappers.
-    Value scalarBase = getScalarBasePtr(addPtrOp.getPtr());
-    if (!scalarBase) return failure();
-
-    // Pre-filter without mutating IR: if no per-element multiplication by a
-    // constant > 1 exists in the offset chain, last stride must be 1.
-    if (!offsetMayContainStrideGtOne(addPtrOp.getOffset())) {
-        return failure();
-    }
-
-    // From here, PtrAnalysis may insert helper IR. Every early-out path
-    // MUST stamp InspectedByStridedLoadStoreRewriteTAG and return success() so
-    // the greedy driver does not re-walk the same op (which would re-run
-    // PtrAnalysis and accumulate dead IR until maxIterations).
-    TritonToStructured::PtrAnalysis ptrAnalysis;
-    TritonToStructured::PtrState ptrState;
-    auto markInspectedAndReturn = [&]() {
-        op->setAttr(InspectedByStridedLoadStoreRewriteTAG,
-                    UnitAttr::get(rewriter.getContext()));
-        return success();
-    };
-    if (ptrAnalysis.visitOperand(op.getPtr(), ptrState, loc, rewriter).failed())
-        return markInspectedAndReturn();
-    if (ptrState.stateInfo.empty()) return markInspectedAndReturn();
-    ptrState.analyzePermute();
-    if (ptrState.isPermuted) return markInspectedAndReturn();
-
-    // Use SIMT indirect only for static non-pow2 or masked single-tile pow2
-    // strides; keep dynamic strides on the structured SIMD path.
-    auto lastStrideOpt = getConstantIntValue(ptrState.stateInfo.back().stride);
-    if (!lastStrideOpt.has_value()) return markInspectedAndReturn();
-    int64_t lastStride = std::abs(lastStrideOpt.value());
-    if (lastStride <= 1) return markInspectedAndReturn();
-    bool routeMaskedPow2ToIndirect =
-        shouldRouteMaskedSingleTilePow2ToIndirect(op.getMask(), resultType);
-    if (lastStride == 2 && !routeMaskedPow2ToIndirect)
-        return markInspectedAndReturn();  // even -> deinterleave; odd -> strided DMA
-    if ((lastStride & (lastStride - 1)) == 0 &&
-        !routeMaskedPow2ToIndirect)
-        return markInspectedAndReturn();  // power-of-two >= 4 -> strided DMA
-
-    Value offsetTensor =
-        ensureI64OffsetTensor(addPtrOp.getOffset(), loc, rewriter);
-    if (!offsetTensor) return failure();
-
-    Value src;
-    Value scalarOffset;
-    if (failed(unwrapScalarAddPtrChain(scalarBase, src, scalarOffset, loc,
-                                       rewriter)))
-        return markInspectedAndReturn();
-    offsetTensor =
-        addScalarOffsetToTensor(offsetTensor, scalarOffset, loc, rewriter);
-
-    auto indirectLoad = rewriter.create<triton::ascend::IndirectLoadOp>(
-        loc, resultType, src, offsetTensor, op.getMask(), op.getOther());
-    indirectLoad->setAttr(RewrittenByStridedLoadStoreRewriteTAG,
-                          UnitAttr::get(rewriter.getContext()));
-
-    LLVM_DEBUG({
-        llvm::dbgs() << "----------------------------------------------\n";
-        llvm::dbgs() << "StridedLoadStoreRewrite [AddPtr]: tt.load -> tt.indirect_load\n";
-        llvm::dbgs() << "  last_stride = " << lastStride << "\n";
-        llvm::dbgs() << indirectLoad << "\n";
-        llvm::dbgs() << "----------------------------------------------\n";
-    });
-    rewriter.replaceOp(op, indirectLoad.getResult());
-    return success();
-}
-
-// Block-ptr path: tt.load(tt.make_tensor_ptr ...) or tt.load(tt.advance ...).
-// Unlike the AddPtr path this does NOT use PtrAnalysis -- strides come
-// directly from mtpt.getStrides() / order from mtpt.getOrder() -- so we
-// can decide everything before touching IR and just return failure() if
-// we don't want to rewrite.
-static LogicalResult tryRewriteBlockPtrLoad(triton::LoadOp op,
-                                            triton::MakeTensorPtrOp mtpt,
-                                            triton::AdvanceOp advance,
-                                            RankedTensorType resultType,
-                                            PatternRewriter &rewriter) {
+static FailureOr<triton::ascend::IndirectLoadOp>
+emitBlockPtrIndirectLoad(triton::LoadOp op, triton::MakeTensorPtrOp mtpt,
+                         triton::AdvanceOp advance,
+                         RankedTensorType resultType,
+                         PatternRewriter &rewriter) {
     auto loc = op.getLoc();
     auto i64Ty = rewriter.getIntegerType(64);
     ArrayRef<int64_t> shape = resultType.getShape();
     int64_t rank = static_cast<int64_t>(shape.size());
 
-    // ---- order must match the "non-permuted" layout: order[i] == rank-1-i,
-    //      i.e. innermost (fastest-changing) is the last dim of the tensor.
-    //      ImplicitPermute handles permuted layouts via tt.trans, so we
-    //      leave anything non-canonical alone.
-    auto order = mtpt.getOrder();
-    if (static_cast<int64_t>(order.size()) != rank) return failure();
-    for (int64_t i = 0; i < rank; ++i) {
-        if (order[i] != rank - 1 - i) {
-            return failure();
-        }
-    }
-
-    // ---- stride check ----
-    auto strides = mtpt.getStrides();
-    if (strides.empty() || static_cast<int64_t>(strides.size()) != rank)
-        return failure();
-    // Stride dispatch: strided DMA on the MTE engine only supports power-of-two
-    // strides; a non-power-of-two stride would degrade to a slow scalar access.
-    // Dynamic strides stay on the structured SIMD path because they may be
-    // runtime stride 1 or power-of-two, where SIMT indirect is slower. So we
-    // only rewrite to SIMT indirect for *static non-power-of-two* strides:
-    //   stride 1 -> contiguous; stride 2 (even dim) -> deinterleave;
-    //   stride >= 4 (power of two) -> (compact) strided DMA.
-    APInt lastStrideC;
-    if (!matchPattern(strides.back(), m_ConstantInt(&lastStrideC)))
-        return failure();
-    int64_t lastStride = std::abs(lastStrideC.getSExtValue());
-    if (lastStride <= 1) return failure();
-    if (lastStride == 2) return failure();  // even -> deinterleave; odd -> strided DMA
-    if ((lastStride & (lastStride - 1)) == 0) return failure();  // power-of-two >= 4 -> strided DMA
-
-    // ---- Compute per-axis effective base offsets: mtpt.offsets[d] + (advance.offsets[d] if present)
     ValueRange mtptOffsets = mtpt.getOffsets();
     ValueRange advOffsets = advance ? advance.getOffsets() : ValueRange{};
     if (static_cast<int64_t>(mtptOffsets.size()) != rank) return failure();
     if (advance && static_cast<int64_t>(advOffsets.size()) != rank)
         return failure();
 
-    // ---- All checks passed: from here on IR mutation is committed. ----
-
-    // Unwrap any `tt.addptr` chain on the SCALAR base ptr (e.g. when the
-    // kernel writes `tl.make_block_ptr(s + bos*H + i_h, ...)`). If we left
-    // those scalar AddPtrs in place, the AddPtrConverter would lower each
-    // into a `memref.reinterpret_cast ... sizes: [1]` single-element view,
-    // and our tt.indirect_load would receive a size-1 src that the per-axis
-    // offset tensor indexes way out of bounds. By walking the scalar AddPtr
-    // chain here we (a) fold its scalar offsets into `scalarBaseAdj` and
-    // (b) recover the original underlying `!tt.ptr<T>` to use as our src.
+    // Fold scalar base AddPtr offsets and keep the original allocation as src.
     Value src = mtpt.getBase();
     Value scalarBaseAdj = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getI64IntegerAttr(0));
     while (auto addptr = src.getDefiningOp<triton::AddPtrOp>()) {
-        // Only unwrap scalar AddPtr chains -- tensor-of-ptrs AddPtrs are not
-        // expected here (mtpt.getBase() is always a scalar ptr).
         if (isa<RankedTensorType>(addptr.getPtr().getType())) break;
         Value off = addptr.getOffset();
         Value offI64 = ensureI64Scalar(off, loc, rewriter);
@@ -499,8 +448,9 @@ static LogicalResult tryRewriteBlockPtrLoad(triton::LoadOp op,
         src = addptr.getPtr();
     }
 
-    // Build the scalar base offset: scalarBaseAdj + sum_d (mtpt.offsets[d] + adv.offsets[d]) * strides[d].
+    // Fold block offsets into scalarBase, then add per-axis tile offsets.
     Value scalarBase = scalarBaseAdj;
+    auto strides = mtpt.getStrides();
     for (int64_t d = 0; d < rank; ++d) {
         Value baseOff = ensureI64Scalar(mtptOffsets[d], loc, rewriter);
         if (!baseOff) return failure();
@@ -515,7 +465,6 @@ static LogicalResult tryRewriteBlockPtrLoad(triton::LoadOp op,
         scalarBase = rewriter.create<arith::AddIOp>(loc, scalarBase, prod);
     }
 
-    // offset_tensor = splat(scalarBase) + sum_d broadcast(arange(0,B_d) * strides[d])
     auto i64TensorTy = RankedTensorType::get(shape, i64Ty);
     Value offsetTensor =
         rewriter.create<triton::SplatOp>(loc, i64TensorTy, scalarBase);
@@ -541,7 +490,6 @@ static LogicalResult tryRewriteBlockPtrLoad(triton::LoadOp op,
     Value other = op.getOther();
     auto boundaryCheck = op.getBoundaryCheck();
     if (!boundaryCheck.empty()) {
-        // Effective offset per axis = mtpt.offsets[d] + (advance.offsets[d] if any)
         SmallVector<Value> effOffsets;
         for (int64_t d = 0; d < rank; ++d) {
             Value off = mtptOffsets[d];
@@ -558,48 +506,41 @@ static LogicalResult tryRewriteBlockPtrLoad(triton::LoadOp op,
         if (!other) {
             other = buildPaddingOther(loc, rewriter, resultType, op.getPadding());
             if (!other) {
-                // PAD_NAN requested on non-float element type: bail to legacy
-                // path (which would also assert there).
                 return failure();
             }
         }
     }
 
-    // ---- Emit tt.indirect_load ----
     auto indirectLoad = rewriter.create<triton::ascend::IndirectLoadOp>(
         loc, resultType, src, offsetTensor, mask, other);
     indirectLoad->setAttr(RewrittenByStridedLoadStoreRewriteTAG,
                           UnitAttr::get(rewriter.getContext()));
-
-    LLVM_DEBUG({
-        llvm::dbgs() << "----------------------------------------------\n";
-        llvm::dbgs() << "StridedLoadStoreRewrite [BlockPtr"
-                     << (advance ? "+Advance" : "")
-                     << (boundaryCheck.empty() ? "" : "+Boundary")
-                     << "]: tt.load -> tt.indirect_load\n";
-        llvm::dbgs() << "  last_stride = " << lastStride << "\n";
-        llvm::dbgs() << indirectLoad << "\n";
-        llvm::dbgs() << "----------------------------------------------\n";
-    });
-    rewriter.replaceOp(op, indirectLoad.getResult());
-    return success();
+    return indirectLoad;
 }
 
-// V2 (Store) helpers ----------------------------------------------------------
-
-// AddPtr path for tt.store. Mirrors tryRewriteAddPtrLoad but emits
-// triton::ascend::IndirectStoreOp and eraseOp's the original tt.store.
-static LogicalResult tryRewriteAddPtrStore(triton::StoreOp op,
-                                            triton::AddPtrOp addPtrOp,
-                                            RankedTensorType valueType,
-                                            PatternRewriter &rewriter) {
+// AddPtr path: tt.load(tt.addptr(tt.splat(%scalar_ptr), %offsets)).
+// Uses PtrAnalysis (which has IR side effects), so this function must
+// stamp InspectedByStridedLoadStoreRewriteTAG on every "PtrAnalysis ran but
+// don't rewrite" path -- see comment block inside.
+static LogicalResult tryRewriteAddPtrLoad(triton::LoadOp op,
+                                          triton::AddPtrOp addPtrOp,
+                                          RankedTensorType resultType,
+                                          PatternRewriter &rewriter) {
     auto loc = op.getLoc();
 
+    // The base must resolve to a scalar pointer through shape-only wrappers.
     Value scalarBase = getScalarBasePtr(addPtrOp.getPtr());
     if (!scalarBase) return failure();
 
-    if (!offsetMayContainStrideGtOne(addPtrOp.getOffset())) return failure();
+    // Skip PtrAnalysis when no tensor-level static/dynamic stride is present.
+    if (!offsetMayContainStrideGtOne(addPtrOp.getOffset())) {
+        return failure();
+    }
 
+    // From here, PtrAnalysis may insert helper IR. Every early-out path
+    // MUST stamp InspectedByStridedLoadStoreRewriteTAG and return success() so
+    // the greedy driver does not re-walk the same op (which would re-run
+    // PtrAnalysis and accumulate dead IR until maxIterations).
     TritonToStructured::PtrAnalysis ptrAnalysis;
     TritonToStructured::PtrState ptrState;
     auto markInspectedAndReturn = [&]() {
@@ -613,79 +554,178 @@ static LogicalResult tryRewriteAddPtrStore(triton::StoreOp op,
     ptrState.analyzePermute();
     if (ptrState.isPermuted) return markInspectedAndReturn();
 
-    // Use SIMT indirect only for static non-pow2 or masked single-tile pow2
-    // strides; keep dynamic strides on the structured SIMD path.
+    // Dynamic stride uses runtime pow2 dispatch; static non-pow2 and masked
+    // single-tile pow2 use SIMT indirect.
     auto lastStrideOpt = getConstantIntValue(ptrState.stateInfo.back().stride);
-    if (!lastStrideOpt.has_value()) return markInspectedAndReturn();
+    if (!lastStrideOpt.has_value()) {
+        Value strideI64 =
+            getDynamicStrideI64(ptrState.stateInfo.back().stride, loc, rewriter);
+        if (!strideI64) return markInspectedAndReturn();
+        Value isPow2 = buildIsPositivePowerOfTwo(strideI64, loc, rewriter);
+        auto ifOp = rewriter.create<scf::IfOp>(
+            loc, TypeRange{resultType}, isPow2, /*withElseRegion=*/true,
+            /*addTerminator=*/true);
+
+        {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(ifOp.thenBlock());
+            Operation *cloned = rewriter.clone(*op.getOperation());
+            cloned->setAttr(InspectedByStridedLoadStoreRewriteTAG,
+                            UnitAttr::get(rewriter.getContext()));
+            rewriter.create<scf::YieldOp>(loc, cloned->getResult(0));
+        }
+        {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(ifOp.elseBlock());
+            auto indirectLoad =
+                emitAddPtrIndirectLoad(op, addPtrOp, scalarBase, resultType,
+                                       rewriter);
+            if (failed(indirectLoad)) return failure();
+            rewriter.create<scf::YieldOp>(loc, indirectLoad->getResult());
+        }
+
+        LLVM_DEBUG({
+            llvm::dbgs() << "----------------------------------------------\n";
+            llvm::dbgs() << "StridedLoadStoreRewrite [AddPtr]: runtime "
+                            "pow2 dispatch for dynamic stride\n";
+            llvm::dbgs() << ifOp << "\n";
+            llvm::dbgs() << "----------------------------------------------\n";
+        });
+        rewriter.replaceOp(op, ifOp.getResult(0));
+        return success();
+    }
     int64_t lastStride = std::abs(lastStrideOpt.value());
     if (lastStride <= 1) return markInspectedAndReturn();
     bool routeMaskedPow2ToIndirect =
-        shouldRouteMaskedSingleTilePow2ToIndirect(op.getMask(), valueType);
+        shouldRouteMaskedSingleTilePow2ToIndirect(op.getMask(), resultType);
     if (lastStride == 2 && !routeMaskedPow2ToIndirect)
         return markInspectedAndReturn();  // even -> deinterleave; odd -> strided DMA
     if ((lastStride & (lastStride - 1)) == 0 &&
         !routeMaskedPow2ToIndirect)
         return markInspectedAndReturn();  // power-of-two >= 4 -> strided DMA
 
-    Value offsetTensor =
-        ensureI64OffsetTensor(addPtrOp.getOffset(), loc, rewriter);
-    if (!offsetTensor) return failure();
-
-    Value src;
-    Value scalarOffset;
-    if (failed(unwrapScalarAddPtrChain(scalarBase, src, scalarOffset, loc,
-                                       rewriter)))
+    auto indirectLoad =
+        emitAddPtrIndirectLoad(op, addPtrOp, scalarBase, resultType, rewriter);
+    if (failed(indirectLoad))
         return markInspectedAndReturn();
-    offsetTensor =
-        addScalarOffsetToTensor(offsetTensor, scalarOffset, loc, rewriter);
-
-    auto indirectStore = rewriter.create<triton::ascend::IndirectStoreOp>(
-        loc, src, offsetTensor, op.getValue(), op.getMask());
-    indirectStore->setAttr(RewrittenByStridedLoadStoreRewriteTAG,
-                           UnitAttr::get(rewriter.getContext()));
 
     LLVM_DEBUG({
         llvm::dbgs() << "----------------------------------------------\n";
-        llvm::dbgs() << "StridedLoadStoreRewrite [AddPtr/Store]: tt.store -> "
-                        "tt.indirect_store\n";
+        llvm::dbgs() << "StridedLoadStoreRewrite [AddPtr]: tt.load -> tt.indirect_load\n";
         llvm::dbgs() << "  last_stride = " << lastStride << "\n";
-        llvm::dbgs() << indirectStore << "\n";
+        llvm::dbgs() << *indirectLoad << "\n";
         llvm::dbgs() << "----------------------------------------------\n";
     });
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, indirectLoad->getResult());
     return success();
 }
 
-// Block-ptr path for tt.store. Mirrors tryRewriteBlockPtrLoad.
-static LogicalResult tryRewriteBlockPtrStore(triton::StoreOp op,
-                                              triton::MakeTensorPtrOp mtpt,
-                                              triton::AdvanceOp advance,
-                                              RankedTensorType valueType,
-                                              PatternRewriter &rewriter) {
+// Block-ptr path: tt.load(tt.make_tensor_ptr ...) or tt.load(tt.advance ...).
+// Unlike the AddPtr path this does NOT use PtrAnalysis -- strides come
+// directly from mtpt.getStrides() / order from mtpt.getOrder() -- so we
+// can decide everything before touching IR and just return failure() if
+// we don't want to rewrite.
+static LogicalResult tryRewriteBlockPtrLoad(triton::LoadOp op,
+                                            triton::MakeTensorPtrOp mtpt,
+                                            triton::AdvanceOp advance,
+                                            RankedTensorType resultType,
+                                            PatternRewriter &rewriter) {
     auto loc = op.getLoc();
-    auto i64Ty = rewriter.getIntegerType(64);
-    ArrayRef<int64_t> shape = valueType.getShape();
+    ArrayRef<int64_t> shape = resultType.getShape();
     int64_t rank = static_cast<int64_t>(shape.size());
 
+    // ---- order must match the "non-permuted" layout: order[i] == rank-1-i,
+    //      i.e. innermost (fastest-changing) is the last dim of the tensor.
+    //      ImplicitPermute handles permuted layouts via tt.trans, so we
+    //      leave anything non-canonical alone.
     auto order = mtpt.getOrder();
     if (static_cast<int64_t>(order.size()) != rank) return failure();
     for (int64_t i = 0; i < rank; ++i) {
-        if (order[i] != rank - 1 - i) return failure();
+        if (order[i] != rank - 1 - i) {
+            return failure();
+        }
     }
 
+    // ---- stride check ----
     auto strides = mtpt.getStrides();
     if (strides.empty() || static_cast<int64_t>(strides.size()) != rank)
         return failure();
-    // Stride dispatch (mirrors tryRewriteBlockPtrLoad): dynamic strides stay on
-    // the structured SIMD path; only static non-power-of-two strides fall
-    // through to SIMT indirect.
+    // Dynamic stride uses runtime pow2 dispatch; static non-pow2 uses SIMT
+    // indirect.
     APInt lastStrideC;
-    if (!matchPattern(strides.back(), m_ConstantInt(&lastStrideC)))
-        return failure();
+    if (!matchPattern(strides.back(), m_ConstantInt(&lastStrideC))) {
+        Value strideI64 = ensureI64Scalar(strides.back(), loc, rewriter);
+        if (!strideI64) return failure();
+        Value isPow2 = buildIsPositivePowerOfTwo(strideI64, loc, rewriter);
+        auto ifOp = rewriter.create<scf::IfOp>(
+            loc, TypeRange{resultType}, isPow2, /*withElseRegion=*/true,
+            /*addTerminator=*/true);
+
+        {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(ifOp.thenBlock());
+            Operation *cloned = rewriter.clone(*op.getOperation());
+            cloned->setAttr(InspectedByStridedLoadStoreRewriteTAG,
+                            UnitAttr::get(rewriter.getContext()));
+            rewriter.create<scf::YieldOp>(loc, cloned->getResult(0));
+        }
+        {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(ifOp.elseBlock());
+            auto indirectLoad =
+                emitBlockPtrIndirectLoad(op, mtpt, advance, resultType,
+                                         rewriter);
+            if (failed(indirectLoad)) return failure();
+            rewriter.create<scf::YieldOp>(loc, indirectLoad->getResult());
+        }
+
+        LLVM_DEBUG({
+            llvm::dbgs() << "----------------------------------------------\n";
+            llvm::dbgs() << "StridedLoadStoreRewrite [BlockPtr"
+                         << (advance ? "+Advance" : "")
+                         << "]: runtime pow2 dispatch for dynamic stride\n";
+            llvm::dbgs() << ifOp << "\n";
+            llvm::dbgs() << "----------------------------------------------\n";
+        });
+        rewriter.replaceOp(op, ifOp.getResult(0));
+        return success();
+    }
+
+    // Static pow2 stays on structured SIMD; static non-pow2 uses SIMT indirect.
     int64_t lastStride = std::abs(lastStrideC.getSExtValue());
     if (lastStride <= 1) return failure();
     if (lastStride == 2) return failure();  // even -> deinterleave; odd -> strided DMA
     if ((lastStride & (lastStride - 1)) == 0) return failure();  // power-of-two >= 4 -> strided DMA
+
+    auto indirectLoad =
+        emitBlockPtrIndirectLoad(op, mtpt, advance, resultType, rewriter);
+    if (failed(indirectLoad)) return failure();
+
+    LLVM_DEBUG({
+        llvm::dbgs() << "----------------------------------------------\n";
+        llvm::dbgs() << "StridedLoadStoreRewrite [BlockPtr"
+                     << (advance ? "+Advance" : "")
+                     << (op.getBoundaryCheck().empty() ? "" : "+Boundary")
+                     << "]: tt.load -> tt.indirect_load\n";
+        llvm::dbgs() << "  last_stride = " << lastStride << "\n";
+        llvm::dbgs() << *indirectLoad << "\n";
+        llvm::dbgs() << "----------------------------------------------\n";
+    });
+    rewriter.replaceOp(op, indirectLoad->getResult());
+    return success();
+}
+
+// V2 (Store) helpers ----------------------------------------------------------
+
+static FailureOr<triton::ascend::IndirectStoreOp>
+emitBlockPtrIndirectStore(triton::StoreOp op, triton::MakeTensorPtrOp mtpt,
+                          triton::AdvanceOp advance,
+                          RankedTensorType valueType,
+                          PatternRewriter &rewriter) {
+    auto loc = op.getLoc();
+    auto i64Ty = rewriter.getIntegerType(64);
+    ArrayRef<int64_t> shape = valueType.getShape();
+    int64_t rank = static_cast<int64_t>(shape.size());
 
     ValueRange mtptOffsets = mtpt.getOffsets();
     ValueRange advOffsets = advance ? advance.getOffsets() : ValueRange{};
@@ -693,11 +733,7 @@ static LogicalResult tryRewriteBlockPtrStore(triton::StoreOp op,
     if (advance && static_cast<int64_t>(advOffsets.size()) != rank)
         return failure();
 
-    // ---- All checks passed: from here on IR mutation is committed. ----
-
-    // Unwrap scalar AddPtr chain on the base (see comment in
-    // tryRewriteBlockPtrLoad for why this is required to avoid lowering to a
-    // size-1 reinterpret_cast view).
+    // Fold scalar base AddPtr offsets and keep the original allocation as src.
     Value src = mtpt.getBase();
     Value scalarBaseAdj = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getI64IntegerAttr(0));
@@ -711,6 +747,7 @@ static LogicalResult tryRewriteBlockPtrStore(triton::StoreOp op,
         src = addptr.getPtr();
     }
 
+    auto strides = mtpt.getStrides();
     Value scalarBase = scalarBaseAdj;
     for (int64_t d = 0; d < rank; ++d) {
         Value baseOff = ensureI64Scalar(mtptOffsets[d], loc, rewriter);
@@ -765,20 +802,177 @@ static LogicalResult tryRewriteBlockPtrStore(triton::StoreOp op,
                     : boundaryMask;
     }
 
-
     auto indirectStore = rewriter.create<triton::ascend::IndirectStoreOp>(
         loc, src, offsetTensor, op.getValue(), mask);
     indirectStore->setAttr(RewrittenByStridedLoadStoreRewriteTAG,
                            UnitAttr::get(rewriter.getContext()));
+    return indirectStore;
+}
+
+// AddPtr path for tt.store. Mirrors tryRewriteAddPtrLoad but emits
+// triton::ascend::IndirectStoreOp and eraseOp's the original tt.store.
+static LogicalResult tryRewriteAddPtrStore(triton::StoreOp op,
+                                            triton::AddPtrOp addPtrOp,
+                                            RankedTensorType valueType,
+                                            PatternRewriter &rewriter) {
+    auto loc = op.getLoc();
+
+    Value scalarBase = getScalarBasePtr(addPtrOp.getPtr());
+    if (!scalarBase) return failure();
+
+    if (!offsetMayContainStrideGtOne(addPtrOp.getOffset())) return failure();
+
+    TritonToStructured::PtrAnalysis ptrAnalysis;
+    TritonToStructured::PtrState ptrState;
+    auto markInspectedAndReturn = [&]() {
+        op->setAttr(InspectedByStridedLoadStoreRewriteTAG,
+                    UnitAttr::get(rewriter.getContext()));
+        return success();
+    };
+    if (ptrAnalysis.visitOperand(op.getPtr(), ptrState, loc, rewriter).failed())
+        return markInspectedAndReturn();
+    if (ptrState.stateInfo.empty()) return markInspectedAndReturn();
+    ptrState.analyzePermute();
+    if (ptrState.isPermuted) return markInspectedAndReturn();
+
+    // Dynamic stride uses runtime pow2 dispatch; static non-pow2 and masked
+    // single-tile pow2 use SIMT indirect.
+    auto lastStrideOpt = getConstantIntValue(ptrState.stateInfo.back().stride);
+    if (!lastStrideOpt.has_value()) {
+        Value strideI64 =
+            getDynamicStrideI64(ptrState.stateInfo.back().stride, loc, rewriter);
+        if (!strideI64) return markInspectedAndReturn();
+        Value isPow2 = buildIsPositivePowerOfTwo(strideI64, loc, rewriter);
+        auto ifOp = rewriter.create<scf::IfOp>(
+            loc, isPow2, /*withElseRegion=*/true);
+
+        {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(ifOp.thenBlock());
+            Operation *cloned = rewriter.clone(*op.getOperation());
+            cloned->setAttr(InspectedByStridedLoadStoreRewriteTAG,
+                            UnitAttr::get(rewriter.getContext()));
+        }
+        {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(ifOp.elseBlock());
+            auto indirectStore =
+                emitAddPtrIndirectStore(op, addPtrOp, scalarBase, rewriter);
+            if (failed(indirectStore)) return failure();
+        }
+
+        LLVM_DEBUG({
+            llvm::dbgs() << "----------------------------------------------\n";
+            llvm::dbgs() << "StridedLoadStoreRewrite [AddPtr/Store]: runtime "
+                            "pow2 dispatch for dynamic stride\n";
+            llvm::dbgs() << ifOp << "\n";
+            llvm::dbgs() << "----------------------------------------------\n";
+        });
+        rewriter.eraseOp(op);
+        return success();
+    }
+    int64_t lastStride = std::abs(lastStrideOpt.value());
+    if (lastStride <= 1) return markInspectedAndReturn();
+    bool routeMaskedPow2ToIndirect =
+        shouldRouteMaskedSingleTilePow2ToIndirect(op.getMask(), valueType);
+    if (lastStride == 2 && !routeMaskedPow2ToIndirect)
+        return markInspectedAndReturn();  // even -> deinterleave; odd -> strided DMA
+    if ((lastStride & (lastStride - 1)) == 0 &&
+        !routeMaskedPow2ToIndirect)
+        return markInspectedAndReturn();  // power-of-two >= 4 -> strided DMA
+
+    auto indirectStore =
+        emitAddPtrIndirectStore(op, addPtrOp, scalarBase, rewriter);
+    if (failed(indirectStore))
+        return markInspectedAndReturn();
+
+    LLVM_DEBUG({
+        llvm::dbgs() << "----------------------------------------------\n";
+        llvm::dbgs() << "StridedLoadStoreRewrite [AddPtr/Store]: tt.store -> "
+                        "tt.indirect_store\n";
+        llvm::dbgs() << "  last_stride = " << lastStride << "\n";
+        llvm::dbgs() << *indirectStore << "\n";
+        llvm::dbgs() << "----------------------------------------------\n";
+    });
+    rewriter.eraseOp(op);
+    return success();
+}
+
+// Block-ptr path for tt.store. Mirrors tryRewriteBlockPtrLoad.
+static LogicalResult tryRewriteBlockPtrStore(triton::StoreOp op,
+                                              triton::MakeTensorPtrOp mtpt,
+                                              triton::AdvanceOp advance,
+                                              RankedTensorType valueType,
+                                              PatternRewriter &rewriter) {
+    auto loc = op.getLoc();
+    ArrayRef<int64_t> shape = valueType.getShape();
+    int64_t rank = static_cast<int64_t>(shape.size());
+
+    auto order = mtpt.getOrder();
+    if (static_cast<int64_t>(order.size()) != rank) return failure();
+    for (int64_t i = 0; i < rank; ++i) {
+        if (order[i] != rank - 1 - i) return failure();
+    }
+
+    auto strides = mtpt.getStrides();
+    if (strides.empty() || static_cast<int64_t>(strides.size()) != rank)
+        return failure();
+    // Dynamic stride uses runtime pow2 dispatch; static non-pow2 uses SIMT
+    // indirect.
+    APInt lastStrideC;
+    if (!matchPattern(strides.back(), m_ConstantInt(&lastStrideC))) {
+        Value strideI64 = ensureI64Scalar(strides.back(), loc, rewriter);
+        if (!strideI64) return failure();
+        Value isPow2 = buildIsPositivePowerOfTwo(strideI64, loc, rewriter);
+        auto ifOp = rewriter.create<scf::IfOp>(
+            loc, isPow2, /*withElseRegion=*/true);
+
+        {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(ifOp.thenBlock());
+            Operation *cloned = rewriter.clone(*op.getOperation());
+            cloned->setAttr(InspectedByStridedLoadStoreRewriteTAG,
+                            UnitAttr::get(rewriter.getContext()));
+        }
+        {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(ifOp.elseBlock());
+            auto indirectStore =
+                emitBlockPtrIndirectStore(op, mtpt, advance, valueType,
+                                          rewriter);
+            if (failed(indirectStore)) return failure();
+        }
+
+        LLVM_DEBUG({
+            llvm::dbgs() << "----------------------------------------------\n";
+            llvm::dbgs() << "StridedLoadStoreRewrite [BlockPtr"
+                         << (advance ? "+Advance" : "")
+                         << "/Store]: runtime pow2 dispatch for dynamic "
+                            "stride\n";
+            llvm::dbgs() << ifOp << "\n";
+            llvm::dbgs() << "----------------------------------------------\n";
+        });
+        rewriter.eraseOp(op);
+        return success();
+    }
+
+    int64_t lastStride = std::abs(lastStrideC.getSExtValue());
+    if (lastStride <= 1) return failure();
+    if (lastStride == 2) return failure();  // even -> deinterleave; odd -> strided DMA
+    if ((lastStride & (lastStride - 1)) == 0) return failure();  // power-of-two >= 4 -> strided DMA
+
+    auto indirectStore =
+        emitBlockPtrIndirectStore(op, mtpt, advance, valueType, rewriter);
+    if (failed(indirectStore)) return failure();
 
     LLVM_DEBUG({
         llvm::dbgs() << "----------------------------------------------\n";
         llvm::dbgs() << "StridedLoadStoreRewrite [BlockPtr"
                      << (advance ? "+Advance" : "")
-                     << (boundaryCheck.empty() ? "" : "+Boundary")
+                     << (op.getBoundaryCheck().empty() ? "" : "+Boundary")
                      << "/Store]: tt.store -> tt.indirect_store\n";
         llvm::dbgs() << "  last_stride = " << lastStride << "\n";
-        llvm::dbgs() << indirectStore << "\n";
+        llvm::dbgs() << *indirectStore << "\n";
         llvm::dbgs() << "----------------------------------------------\n";
     });
     rewriter.eraseOp(op);
