@@ -96,3 +96,67 @@ func[grid](in_out_tensor, in_out_tensor)
 ```
 
 In the above code, `ptr0` and `ptr1` actually point to the same memory (i.e., the same `in_out_tensor`), but the compiler cannot identify this pointer alias relationship. Therefore, passing the same tensor as multiple pointer parameters is not supported, and the corresponding kernel will not be able to enable related optimizations.
+
+**Q: What are the limitations of using `tl.load` / `tl.store` in control flow such as `if` / `for` / `while`?**
+
+A: Triton-Ascend supports memory accesses where pointers from the same source are updated with simple address changes inside control flow.
+It is also valid to place `tl.load` / `tl.store` directly inside control flow.
+However, it is not recommended to merge pointers from different sources or pointers with different block-pointer layouts after control flow and then perform one unified memory access.
+It is also not recommended to repeatedly update pointer state across complex nested control flow while performing store/read-after-write in the same pattern.
+
+Do not merge pointers with different base addresses and load after the branch:
+
+```Python
+if cond:
+    ptr = x + offsets
+else:
+    ptr = y + offsets
+value = tl.load(ptr)
+```
+
+Instead, place the memory access in each branch, so the branch merges the loaded value rather than the pointer:
+
+```Python
+if cond:
+    value = tl.load(x + offsets)
+else:
+    value = tl.load(y + offsets)
+```
+
+If different branches construct block pointers with different layouts, also perform the memory access inside each branch:
+
+```Python
+if cond:
+    bp0 = tl.make_block_ptr(x, shape0, strides0, offsets0, block_shape0, order0)
+    value = tl.load(bp0)
+else:
+    bp1 = tl.make_block_ptr(x, shape1, strides1, offsets1, block_shape1, order1)
+    value = tl.load(bp1)
+```
+
+If only the access offset differs and the rest of the block-pointer layout is the same,
+select the offset in the branch and construct one common block pointer afterwards:
+
+```Python
+if cond:
+    off = off0
+else:
+    off = off1
+bp = tl.make_block_ptr(x, shape, strides, (off,), block_shape, order)
+value = tl.load(bp)
+```
+
+For pointer updates inside nested control flow, prefer carrying a step or offset and update/access the pointer at a common location.
+This reduces the need to carry a full pointer as control-flow state across branches or loops:
+
+```Python
+if cond:
+    step = step0
+else:
+    step = step1
+bp = tl.advance(bp, [step])
+value = tl.load(bp)
+```
+
+In addition, storing through a pointer updated inside control flow and then reading related memory later involves aliasing and read/write ordering.
+FP8, `tl.dot`, indirect load, atomic operations, and other compound paths combined with control-flow memory access also require end-to-end validation for the specific operator.
