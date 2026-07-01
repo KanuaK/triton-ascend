@@ -343,12 +343,9 @@ void init_triton_ir(py::module &&m) {
       .value("TF32", InputPrecision::TF32)
       .value("TF32x3", InputPrecision::TF32x3)
       .value("IEEE", InputPrecision::IEEE)
-<<<<<<< HEAD
       .value("HF32", InputPrecision::HF32)
-=======
       .value("BF16x3", InputPrecision::BF16x3)
       .value("BF16x6", InputPrecision::BF16x6)
->>>>>>> 85400f80bf859a34ad7a746ffda877faf80312ab
       .export_values();
 
   py::enum_<ScaleDotElemType>(m, "ScaleDotElemTypeTY", py::module_local())

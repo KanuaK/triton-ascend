@@ -65,13 +65,6 @@ public:
     builder->setInsertionPointAfter(&op);
   }
 
-<<<<<<< HEAD
-  void restoreInsertionPoint(OpBuilder::InsertPoint pt) {
-    if (pt.isSet() && pt.getPoint() != pt.getBlock()->end())
-      setLastLoc(pt.getPoint()->getLoc());
-    else
-      setLastLoc(builder->getUnknownLoc());
-=======
   void restoreInsertionPoint(mlir::OpBuilder::InsertPoint pt) {
     setLastLoc(builder->getUnknownLoc());
     if (pt.isSet()) {
@@ -81,7 +74,6 @@ public:
         setLastLoc(getLocForBlock(pt.getBlock()));
     }
 
->>>>>>> 85400f80bf859a34ad7a746ffda877faf80312ab
     builder->restoreInsertionPoint(pt);
   }
 
@@ -107,23 +99,17 @@ public:
   }
 
 private:
-<<<<<<< HEAD
-  std::unique_ptr<OpBuilder> builder;
-  std::unique_ptr<Location> lastLoc;
-  bool lineInfoEnabled = !triton::tools::getBoolEnv("TRITON_DISABLE_LINE_INFO");
-  std::string compile_mode;
-=======
   std::unique_ptr<mlir::OpBuilder> builder;
   std::unique_ptr<mlir::Location> lastLoc;
   bool lineInfoEnabled =
       !mlir::triton::tools::getBoolEnv("TRITON_DISABLE_LINE_INFO");
+  std::string compile_mode;
 
   mlir::Location getLocForBlock(mlir::Block *block) {
     if (auto parentOp = block->getParentOp())
       return parentOp->getLoc();
     return builder->getUnknownLoc();
   }
->>>>>>> 85400f80bf859a34ad7a746ffda877faf80312ab
 };
 
 namespace ir {

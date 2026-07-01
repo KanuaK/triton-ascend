@@ -20,7 +20,8 @@ from functools import partial
 from .._C.libtriton import interpreter as _interpreter
 from .._C.libtriton import ir as _ir
 
-<<<<<<< HEAD
+T = TypeVar("T")
+
 # Import Ascend-specific interpreter builder (with deferred import to avoid circular dependency)
 _has_ascend_support = False
 AscendInterpreterBuilder = None
@@ -39,9 +40,6 @@ def _try_import_ascend():
         # Catch other exceptions (like circular import) and log them
         _has_ascend_support = False
         AscendInterpreterBuilder = None
-=======
-T = TypeVar("T")
->>>>>>> 85400f80bf859a34ad7a746ffda877faf80312ab
 
 
 @dataclass
@@ -1388,14 +1386,6 @@ class GridExecutor:
         # remaps core language functions to interpreted ones
         patch_scope = _patch_lang(self.fn)
         try:
-<<<<<<< HEAD
-            # Execute kernels - sub_vec_id simulation handled by AscendInterpreterBuilder
-            if hasattr(interpreter_builder, 'execute_with_sub_vec_simulation'):
-                # Ascend builder with sub-vector simulation
-                interpreter_builder.execute_with_sub_vec_simulation(self.fn, args, grid)
-            else:
-                # Standard execution for base interpreter
-=======
             # we need to copy arguments to the host for the interpreter
             # implicitly convert tensor arguments to their base pointers
             args = inspect.getcallargs(self.fn, *args_hst, **kwargs_hst)
@@ -1406,25 +1396,20 @@ class GridExecutor:
             grid = grid + (1, ) * (3 - len(grid))
             interpreter_builder.set_grid_dim(*grid)
             try:
->>>>>>> 85400f80bf859a34ad7a746ffda877faf80312ab
-                for x in range(grid[0]):
-                    for y in range(grid[1]):
-                        for z in range(grid[2]):
-                            interpreter_builder.set_grid_idx(x, y, z)
-                            self.fn(**args)
-<<<<<<< HEAD
-        except Exception as e:
-            if triton.knobs.compilation.front_end_debugging:
-                raise
-            raise InterpreterError(repr(e)) from e
-=======
+                if hasattr(interpreter_builder, 'execute_with_sub_vec_simulation'):
+                    interpreter_builder.execute_with_sub_vec_simulation(self.fn, args, grid)
+                else:
+                    for x in range(grid[0]):
+                        for y in range(grid[1]):
+                            for z in range(grid[2]):
+                                interpreter_builder.set_grid_idx(x, y, z)
+                                self.fn(**args)
             except Exception as e:
                 if triton.knobs.compilation.front_end_debugging:
                     raise
                 raise InterpreterError(repr(e)) from e
         finally:
             patch_scope.restore()
->>>>>>> 85400f80bf859a34ad7a746ffda877faf80312ab
         # copy arguments back to propagate side-effects
         self._restore_args_dev(args_dev, args_hst, kwargs, kwargs_hst)
 

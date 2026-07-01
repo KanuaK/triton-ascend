@@ -11,11 +11,7 @@ from typing import Dict, Tuple, Optional, List
 
 from .. import knobs
 from .jit import KernelInterface, JITFunction
-<<<<<<< HEAD
-from .errors import OutOfResources
-=======
 from .errors import OutOfResources, PTXASError, AutotunerError
->>>>>>> 85400f80bf859a34ad7a746ffda877faf80312ab
 from .driver import driver
 from .cache import get_cache_manager, triton_key
 from triton._C.libtriton import get_cache_invalidating_env_vars
