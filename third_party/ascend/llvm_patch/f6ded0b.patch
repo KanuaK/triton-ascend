@@ -92,14 +92,11 @@ diff --git a/mlir/lib/Dialect/Arith/IR/ArithOps.cpp b/mlir/lib/Dialect/Arith/IR/
 index 7d4d818ee448..3fdc036abf14 100644
 --- a/mlir/lib/Dialect/Arith/IR/ArithOps.cpp
 +++ b/mlir/lib/Dialect/Arith/IR/ArithOps.cpp
-@@ -1560,6 +1560,16 @@ LogicalResult arith::ScalingExtFOp::verify() {
+@@ -1560,6 +1560,13 @@ LogicalResult arith::ScalingExtFOp::verify() {
  //===----------------------------------------------------------------------===//
  // TruncIOp
  //===----------------------------------------------------------------------===//
 +::llvm::LogicalResult TruncIOp::readProperties(::mlir::DialectBytecodeReader &reader, ::mlir::OperationState &state) {
-+  auto &prop = state.getOrAddProperties<Properties>(); (void)prop;
-+  if (::mlir::failed(reader.readOptionalAttribute(prop.overflowFlags)))
-+    return ::mlir::failure();
 +  return ::mlir::success();
 +}
 +
@@ -361,7 +358,7 @@ diff --git a/mlir/lib/Dialect/Linalg/IR/LinalgOps.cpp b/mlir/lib/Dialect/Linalg/
 index e0e371617729..da3ab7590e54 100644
 --- a/mlir/lib/Dialect/Linalg/IR/LinalgOps.cpp
 +++ b/mlir/lib/Dialect/Linalg/IR/LinalgOps.cpp
-@@ -203,6 +203,110 @@ static void buildMatmulOp(OpBuilder &b, OperationState &state,
+@@ -203,6 +203,112 @@ static void buildMatmulOp(OpBuilder &b, OperationState &state,
                             attributes, regionBuilder);
  }
  
@@ -455,6 +452,8 @@ index e0e371617729..da3ab7590e54 100644
 +void BatchMatmulOp::writeProperties(::mlir::DialectBytecodeWriter &writer) {
 +  auto &prop = getProperties(); (void)prop;
 +
++  writer.writeOptionalAttribute(prop.cast);
++
 +if (writer.getBytecodeVersion() < /*kNativePropertiesODSSegmentSize=*/6) {
 +  auto &propStorage = prop.operandSegmentSizes;
 +  writer.writeAttribute(::mlir::DenseI32ArrayAttr::get(this->getContext(), propStorage));
@@ -495,3 +494,187 @@ index 0dbc041d231a..9d1960a65a74 100644
  
  void ForOp::build(OpBuilder &builder, OperationState &result, Value lb,
                    Value ub, Value step, ValueRange initArgs,
+diff --git a/mlir/include/mlir/Dialect/LLVMIR/LLVMOps.td b/mlir/include/mlir/Dialect/LLVMIR/LLVMOps.td
+--- a/mlir/include/mlir/Dialect/LLVMIR/LLVMOps.td
++++ b/mlir/include/mlir/Dialect/LLVMIR/LLVMOps.td
+@@ -458,3 +458,4 @@
+   ];
+   let hasVerifier = 1;
++  let useCustomPropertiesEncoding = 1;
+ }
+@@ -535,3 +536,4 @@
+   ];
+   let hasVerifier = 1;
++  let useCustomPropertiesEncoding = 1;
+ }
+@@ -621,8 +623,10 @@
+   let hasFolder = 1;
+ }
+ def LLVM_IntToPtrOp : LLVM_DereferenceableCastOp<"inttoptr", "IntToPtr",
+-                                  LLVM_ScalarOrVectorOf<AnySignlessInteger>,
+-                                  LLVM_ScalarOrVectorOf<LLVM_AnyPointer>>;
++                                  LLVM_ScalarOrVectorOf<AnySignlessInteger>,
++                                  LLVM_ScalarOrVectorOf<LLVM_AnyPointer>> {
++  let useCustomPropertiesEncoding = 1;
++}
+ def LLVM_PtrToIntOp : LLVM_CastOp<"ptrtoint", "PtrToInt",
+                                   LLVM_ScalarOrVectorOf<LLVM_AnyPointer>,
+                                   LLVM_ScalarOrVectorOf<AnySignlessInteger>>;
+@@ -2409,7 +2413,8 @@ def LLVM_InlineAsmOp : LLVM_Op<"inline_asm", [DeclareOpInterfaceMethods<MemoryEf
+     static StringRef getElementTypeAttrName() {
+       return "elementtype";
+     }
+   }];
+ 
+   let hasVerifier = 1;
++  let useCustomPropertiesEncoding = 1;
+ }
+diff --git a/mlir/lib/Dialect/LLVMIR/IR/LLVMDialect.cpp b/mlir/lib/Dialect/LLVMIR/IR/LLVMDialect.cpp
+index 5d08cccb4faa..000000000000 100644
+--- a/mlir/lib/Dialect/LLVMIR/IR/LLVMDialect.cpp
++++ b/mlir/lib/Dialect/LLVMIR/IR/LLVMDialect.cpp
+@@ -837,3 +837,47 @@ LogicalResult LLVM::GEPOp::verify() {
++::llvm::LogicalResult LoadOp::readProperties(
++    ::mlir::DialectBytecodeReader &reader, ::mlir::OperationState &state) {
++  auto &prop = state.getOrAddProperties<Properties>(); (void)prop;
++  if (::mlir::failed(reader.readOptionalAttribute(prop.access_groups)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.alias_scopes)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.alignment)))
++    return ::mlir::failure();
++  prop.dereferenceable = nullptr;
++  if (::mlir::failed(reader.readOptionalAttribute(prop.invariant)))
++    return ::mlir::failure();
++  prop.invariantGroup = nullptr;
++  if (::mlir::failed(reader.readOptionalAttribute(prop.noalias_scopes)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.nontemporal)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.ordering)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.syncscope)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.tbaa)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.volatile_)))
++    return ::mlir::failure();
++  return ::mlir::success();
++}
++
++void LoadOp::writeProperties(::mlir::DialectBytecodeWriter &writer) {
++  auto &prop = getProperties(); (void)prop;
++  writer.writeOptionalAttribute(prop.access_groups);
++  writer.writeOptionalAttribute(prop.alias_scopes);
++  writer.writeOptionalAttribute(prop.alignment);
++  // LLVM 20 does not know the dereferenceable load property.
++  writer.writeOptionalAttribute(prop.invariant);
++  // LLVM 20 does not know the invariant_group load property.
++  writer.writeOptionalAttribute(prop.noalias_scopes);
++  writer.writeOptionalAttribute(prop.nontemporal);
++  writer.writeOptionalAttribute(prop.ordering);
++  writer.writeOptionalAttribute(prop.syncscope);
++  writer.writeOptionalAttribute(prop.tbaa);
++  writer.writeOptionalAttribute(prop.volatile_);
++}
++
+ void LoadOp::getEffects(
+     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+         &effects) {
+@@ -916,3 +960,42 @@ void LoadOp::build(OpBuilder &builder, OperationState &state, Type type,
++::llvm::LogicalResult StoreOp::readProperties(
++    ::mlir::DialectBytecodeReader &reader, ::mlir::OperationState &state) {
++  auto &prop = state.getOrAddProperties<Properties>(); (void)prop;
++  if (::mlir::failed(reader.readOptionalAttribute(prop.access_groups)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.alias_scopes)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.alignment)))
++    return ::mlir::failure();
++  prop.invariantGroup = nullptr;
++  if (::mlir::failed(reader.readOptionalAttribute(prop.noalias_scopes)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.nontemporal)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.ordering)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.syncscope)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.tbaa)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.volatile_)))
++    return ::mlir::failure();
++  return ::mlir::success();
++}
++
++void StoreOp::writeProperties(::mlir::DialectBytecodeWriter &writer) {
++  auto &prop = getProperties(); (void)prop;
++  writer.writeOptionalAttribute(prop.access_groups);
++  writer.writeOptionalAttribute(prop.alias_scopes);
++  writer.writeOptionalAttribute(prop.alignment);
++  // LLVM 20 does not know the invariant_group store property.
++  writer.writeOptionalAttribute(prop.noalias_scopes);
++  writer.writeOptionalAttribute(prop.nontemporal);
++  writer.writeOptionalAttribute(prop.ordering);
++  writer.writeOptionalAttribute(prop.syncscope);
++  writer.writeOptionalAttribute(prop.tbaa);
++  writer.writeOptionalAttribute(prop.volatile_);
++}
++
+ void StoreOp::getEffects(
+     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+         &effects) {
+@@ -950,3 +1033,14 @@ void StoreOp::build(OpBuilder &builder, OperationState &state, Value value,
++::llvm::LogicalResult IntToPtrOp::readProperties(
++    ::mlir::DialectBytecodeReader &reader, ::mlir::OperationState &state) {
++  auto &prop = state.getOrAddProperties<Properties>(); (void)prop;
++  prop.dereferenceable = nullptr;
++  return ::mlir::success();
++}
++
++void IntToPtrOp::writeProperties(::mlir::DialectBytecodeWriter &writer) {
++  return;
++}
++
+ //===----------------------------------------------------------------------===//
+ // CallOp
+ //===----------------------------------------------------------------------===//
+@@ -4197,6 +4291,37 @@ void LLVM::masked_compressstore::build(OpBuilder &builder,
+ // InlineAsmOp
+ //===----------------------------------------------------------------------===//
+-
++::llvm::LogicalResult InlineAsmOp::readProperties(
++    ::mlir::DialectBytecodeReader &reader, ::mlir::OperationState &state) {
++  auto &prop = state.getOrAddProperties<Properties>(); (void)prop;
++  if (::mlir::failed(reader.readOptionalAttribute(prop.asm_dialect)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readAttribute(prop.asm_string)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readAttribute(prop.constraints)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.has_side_effects)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.is_align_stack)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.operand_attrs)))
++    return ::mlir::failure();
++  // LLVM 20 does not know the tail_call_kind inline asm property.
++  prop.tail_call_kind =
++      TailCallKindAttr::get(state.getContext(), TailCallKind::None);
++  return ::mlir::success();
++}
++
++void InlineAsmOp::writeProperties(::mlir::DialectBytecodeWriter &writer) {
++  auto &prop = getProperties(); (void)prop;
++  writer.writeOptionalAttribute(prop.asm_dialect);
++  writer.writeAttribute(prop.asm_string);
++  writer.writeAttribute(prop.constraints);
++  writer.writeOptionalAttribute(prop.has_side_effects);
++  writer.writeOptionalAttribute(prop.is_align_stack);
++  writer.writeOptionalAttribute(prop.operand_attrs);
++  // LLVM 20 does not know the tail_call_kind inline asm property.
++}
++
+ LogicalResult InlineAsmOp::verify() {
+   if (!getTailCallKindAttr())
+     return success();
