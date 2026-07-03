@@ -492,9 +492,45 @@ index 0dbc041d231a..9d1960a65a74 100644
  
  void ForOp::build(OpBuilder &builder, OperationState &result, Value lb,
                    Value ub, Value step, ValueRange initArgs,
+diff --git a/mlir/lib/Bytecode/Writer/BytecodeWriter.cpp b/mlir/lib/Bytecode/Writer/BytecodeWriter.cpp
+--- a/mlir/lib/Bytecode/Writer/BytecodeWriter.cpp
++++ b/mlir/lib/Bytecode/Writer/BytecodeWriter.cpp
+@@ -1025,11 +1025,21 @@ LogicalResult BytecodeWriter::writeOp(EncodingEmitter &emitter, Operation *op) {
+   }
+ 
+   // Emit the operands of the operation.
+-  if (unsigned numOperands = op->getNumOperands()) {
++  unsigned numOperands = op->getNumOperands();
++  bool dropAssumeOperandBundles =
++      op->getName().getStringRef() == "llvm.intr.assume" && numOperands > 1;
++  if (dropAssumeOperandBundles)
++    numOperands = 1;
++  if (numOperands) {
+     opEncodingMask |= bytecode::OpEncodingMask::kHasOperands;
+     emitter.emitVarInt(numOperands, "op operands count");
+-    for (Value operand : op->getOperands())
+-      emitter.emitVarInt(numberingState.getNumber(operand), "op operand types");
++    if (dropAssumeOperandBundles) {
++      emitter.emitVarInt(numberingState.getNumber(op->getOperand(0)),
++                         "op operand types");
++    } else {
++      for (Value operand : op->getOperands())
++        emitter.emitVarInt(numberingState.getNumber(operand), "op operand types");
++    }
+   }
+ 
+   // Emit the successors of the operation.
 diff --git a/mlir/include/mlir/Dialect/LLVMIR/LLVMOps.td b/mlir/include/mlir/Dialect/LLVMIR/LLVMOps.td
 --- a/mlir/include/mlir/Dialect/LLVMIR/LLVMOps.td
 +++ b/mlir/include/mlir/Dialect/LLVMIR/LLVMOps.td
+@@ -456,6 +456,7 @@ def LLVM_LoadOp : LLVM_MemAccessOpBase<"load",
+       CArg<"StringRef", "StringRef()">:$syncscope)>
+   ];
+   let hasVerifier = 1;
++  let useCustomPropertiesEncoding = 1;
+ }
+ 
+ def LLVM_StoreOp : LLVM_MemAccessOpBase<"store",
 @@ -621,8 +621,10 @@
    let hasFolder = 1;
  }
@@ -521,7 +557,56 @@ diff --git a/mlir/lib/Dialect/LLVMIR/IR/LLVMDialect.cpp b/mlir/lib/Dialect/LLVMI
 index 5d08cccb4faa..000000000000 100644
 --- a/mlir/lib/Dialect/LLVMIR/IR/LLVMDialect.cpp
 +++ b/mlir/lib/Dialect/LLVMIR/IR/LLVMDialect.cpp
-@@ -950,3 +950,14 @@ void StoreOp::build(OpBuilder &builder, OperationState &state, Value value,
+@@ -950,3 +950,63 @@ void StoreOp::build(OpBuilder &builder, OperationState &state, Value value,
++::llvm::LogicalResult LoadOp::readProperties(
++    ::mlir::DialectBytecodeReader &reader, ::mlir::OperationState &state) {
++  auto &prop = state.getOrAddProperties<Properties>(); (void)prop;
++  if (::mlir::failed(reader.readOptionalAttribute(prop.access_groups)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.alias_scopes)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.alignment)))
++    return ::mlir::failure();
++  ::mlir::Attribute dereferenceable;
++  if (::mlir::failed(reader.readOptionalAttribute(dereferenceable)))
++    return ::mlir::failure();
++  prop.dereferenceable = nullptr;
++  if (::mlir::failed(reader.readOptionalAttribute(prop.invariant)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.invariantGroup)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.noalias_scopes)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.nontemporal)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.ordering)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.syncscope)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.tbaa)))
++    return ::mlir::failure();
++  if (::mlir::failed(reader.readOptionalAttribute(prop.volatile_)))
++    return ::mlir::failure();
++  return ::mlir::success();
++}
++
++void LoadOp::writeProperties(::mlir::DialectBytecodeWriter &writer) {
++  auto &prop = getProperties(); (void)prop;
++  writer.writeOptionalAttribute(prop.access_groups);
++  writer.writeOptionalAttribute(prop.alias_scopes);
++  writer.writeOptionalAttribute(prop.alignment);
++  // LLVM 19/20 does not know the dereferenceable load property.
++  writer.writeOptionalAttribute(::mlir::Attribute());
++  writer.writeOptionalAttribute(prop.invariant);
++  writer.writeOptionalAttribute(prop.invariantGroup);
++  writer.writeOptionalAttribute(prop.noalias_scopes);
++  writer.writeOptionalAttribute(prop.nontemporal);
++  writer.writeOptionalAttribute(prop.ordering);
++  writer.writeOptionalAttribute(prop.syncscope);
++  writer.writeOptionalAttribute(prop.tbaa);
++  writer.writeOptionalAttribute(prop.volatile_);
++}
++
 +::llvm::LogicalResult IntToPtrOp::readProperties(
 +    ::mlir::DialectBytecodeReader &reader, ::mlir::OperationState &state) {
 +  auto &prop = state.getOrAddProperties<Properties>(); (void)prop;
