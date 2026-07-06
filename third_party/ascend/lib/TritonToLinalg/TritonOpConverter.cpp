@@ -1705,11 +1705,28 @@ LogicalResult ExternElementwiseClOpConverter::matchAndRewrite(
     // libdevice -> hivm.hir.custom
     bool is_libdevice = llvm::is_contained(libdeviceOps, op.getSymbol());
     if (is_libdevice) {
+      bool hasScalarResult = llvm::any_of(op->getResults(), [](Value result) {
+        return !isa<RankedTensorType>(result.getType());
+      });
+      SmallVector<Value> newInputs;
+      for (auto input : op->getOperands()) {
+        if (hasScalarResult && !isa<RankedTensorType>(input.getType())) {
+          input = rewriter.create<tensor::FromElementsOp>(
+              op.getLoc(),
+              RankedTensorType::get({(int64_t)1}, input.getType()), input);
+        }
+        newInputs.push_back(input);
+      }
+
       SmallVector<Value> newOuts;
       SmallVector<Type> originalOutputTypes;
       for (auto newOut : op->getResults()) {
-        originalOutputTypes.push_back(newOut.getType());
-        auto tensorType = dyn_cast<RankedTensorType>(newOut.getType());
+        Type originalType = newOut.getType();
+        originalOutputTypes.push_back(originalType);
+        auto tensorType = dyn_cast<RankedTensorType>(originalType);
+        if (!tensorType) {
+          tensorType = RankedTensorType::get({(int64_t)1}, originalType);
+        }
         Type elemType = tensorType.getElementType();
         if (elemType.isInteger(1)) {
           elemType = rewriter.getI32Type();
@@ -1718,7 +1735,7 @@ LogicalResult ExternElementwiseClOpConverter::matchAndRewrite(
               op->getLoc(), tensorType.getShape(), elemType);
         newOuts.push_back(src);
       }
-      ValueRange inputs{op->getOperands()};
+      ValueRange inputs{newInputs};
       ValueRange outputs{newOuts};
       ValueRange temp_buffers{};
       TypeRange res_types{outputs};
@@ -1737,25 +1754,32 @@ LogicalResult ExternElementwiseClOpConverter::matchAndRewrite(
       SmallVector<Value> finalResults;
       for (auto [customResult, origType] : llvm::zip(customRes.getResults(), originalOutputTypes)) {
         auto origTensorType = dyn_cast<RankedTensorType>(origType);
-        Type targetElemType = rewriter.getI8Type();
-        Type targetTensorType = RankedTensorType::get(
-          origTensorType.getShape(),
-          targetElemType
-        );
+        bool isScalar = !origTensorType;
+        auto resultTensorType =
+            isScalar ? RankedTensorType::get({(int64_t)1}, origType)
+                     : origTensorType;
 
-        if (origTensorType.getElementType().isInteger(1)) {
+        Value finalResult = customResult;
+        if (resultTensorType.getElementType().isInteger(1)) {
           auto i32ElemType = rewriter.getI32Type();
           auto denseZeroAttr = DenseElementsAttr::get(
-              RankedTensorType::get(origTensorType.getShape(), i32ElemType), 0);
+              RankedTensorType::get(resultTensorType.getShape(), i32ElemType),
+              0);
           auto zeroTensor = rewriter.create<arith::ConstantOp>(
               loc, denseZeroAttr);
           auto cmp = rewriter.create<arith::CmpIOp>(
             loc, arith::CmpIPredicate::ne, customResult, zeroTensor);
 
-          finalResults.push_back(cmp);
-        } else {
-          finalResults.push_back(customResult);
+          finalResult = cmp;
         }
+        if (isScalar) {
+          auto indexType = rewriter.getIndexType();
+          Value zeroConstant = rewriter.create<arith::ConstantOp>(
+              loc, indexType, rewriter.getIntegerAttr(indexType, 0));
+          finalResult = rewriter.create<tensor::ExtractOp>(
+              loc, finalResult, zeroConstant);
+        }
+        finalResults.push_back(finalResult);
       }
       rewriter.replaceOp(op, finalResults);
       return success();
