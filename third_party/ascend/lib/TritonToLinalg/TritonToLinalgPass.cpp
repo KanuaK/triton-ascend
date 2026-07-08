@@ -698,6 +698,7 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   patterns.add<TTOpConverters::DenseConstantConverter>(patterns.getContext());
   patterns.add<TTOpConverters::ExternElementwiseClOpConverter>(
       patterns.getContext());
+  patterns.add<TTOpConverters::MapElementwiseConverter>(patterns.getContext());
   patterns.add<TTOpConverters::TritonMulhiuiConverter>(patterns.getContext());
   patterns.add<TTOpConverters::TritonPreciseSqrtConverter>(
       patterns.getContext());
@@ -1045,7 +1046,7 @@ void TritonToLinalgPass::runOnOperation() {
     return !op.getOperation()->hasAttr("UnhandledLoopOp");
   };
 
-  target.addIllegalOp<triton::ScanOp>();
+  target.addIllegalOp<triton::ScanOp, triton::MapElementwiseOp>();
   target.addDynamicallyLegalOp<scf::ForOp>(loopOpLegalFn);
   target.addDynamicallyLegalOp<scf::WhileOp>(loopOpLegalFn);
 

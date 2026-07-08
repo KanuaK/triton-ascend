@@ -128,6 +128,11 @@ public:
       return rewriter.notifyMatchFailure(
           op, "ScalarMathCanonicalizer handles op not within tt.scan.");
     }
+    if (op->template getParentOfType<triton::MapElementwiseOp>()) {
+      return rewriter.notifyMatchFailure(
+          op,
+          "ScalarMathCanonicalizer handles op not within tt.map_elementwise.");
+    }
     auto loc = op.getLoc();
     llvm::SmallVector<Value> inputs;
     for (auto input : op->getOperands()) {
@@ -487,6 +492,15 @@ public:
   using OpConversionPattern<triton::ExternElementwiseOp>::OpConversionPattern;
   LogicalResult
   matchAndRewrite(triton::ExternElementwiseOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+class MapElementwiseConverter
+    : public OpConversionPattern<triton::MapElementwiseOp> {
+public:
+  using OpConversionPattern<triton::MapElementwiseOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(triton::MapElementwiseOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override;
 };
 
