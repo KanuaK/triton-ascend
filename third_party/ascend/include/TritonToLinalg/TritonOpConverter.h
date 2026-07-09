@@ -130,8 +130,7 @@ public:
     }
     if (op->template getParentOfType<triton::MapElementwiseOp>()) {
       return rewriter.notifyMatchFailure(
-          op,
-          "ScalarMathCanonicalizer handles op not within tt.map_elementwise.");
+          op, "ScalarMathCanonicalizer skips op within tt.map_elementwise.");
     }
     auto loc = op.getLoc();
     llvm::SmallVector<Value> inputs;

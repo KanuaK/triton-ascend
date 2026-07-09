@@ -2041,12 +2041,12 @@ LogicalResult MapElementwiseConverter::matchAndRewrite(
 
   // Each result becomes a loop-carried tensor. Check shape compatibility
   // before cloning scalar code so malformed multi-result ops fail early.
-  SmallVector<Value> outputs;
   auto firstResultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
   if (!firstResultType) {
     return rewriter.notifyMatchFailure(
         op, "map_elementwise result must be a ranked tensor");
   }
+  SmallVector<RankedTensorType> resultTypes;
   auto hasCompatibleShape = [](RankedTensorType lhs, RankedTensorType rhs) {
     if (lhs.getRank() != rhs.getRank()) {
       return false;
@@ -2072,8 +2072,7 @@ LogicalResult MapElementwiseConverter::matchAndRewrite(
       return rewriter.notifyMatchFailure(
           op, "map_elementwise results must have compatible shapes");
     }
-    outputs.push_back(rewriter.create<tensor::EmptyOp>(
-        loc, resultType.getShape(), resultType.getElementType()));
+    resultTypes.push_back(resultType);
   }
 
   Region &scalarRegion = op.getScalarOp();
@@ -2121,6 +2120,10 @@ LogicalResult MapElementwiseConverter::matchAndRewrite(
           op, "map_elementwise inputs and results must have compatible shapes");
     }
     inputs.push_back(input);
+  }
+  if (inputs.empty()) {
+    return rewriter.notifyMatchFailure(
+        op, "map_elementwise must have at least one input");
   }
   if (scalarBlock.getNumArguments() != inputs.size() * pack) {
     return rewriter.notifyMatchFailure(
@@ -2223,8 +2226,26 @@ LogicalResult MapElementwiseConverter::matchAndRewrite(
     }
   }
 
+  auto createOutputs = [&](ArrayRef<Value> dimSizes) {
+    SmallVector<Value> outputs;
+    outputs.reserve(resultTypes.size());
+    for (RankedTensorType resultType : resultTypes) {
+      SmallVector<Value> dynamicSizes;
+      for (int64_t i = 0; i < resultType.getRank(); ++i) {
+        if (resultType.isDynamicDim(i)) {
+          dynamicSizes.push_back(dimSizes[i]);
+        }
+      }
+      outputs.push_back(
+          rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicSizes));
+    }
+    return outputs;
+  };
+
   if (rank == 0) {
+    SmallVector<Value> noDynamicSizes;
     SmallVector<SmallVector<Value>> packIndices(pack);
+    SmallVector<Value> outputs = createOutputs(noDynamicSizes);
     rewriter.replaceOp(op,
                        scalarBodyBuilder(rewriter, loc, packIndices, outputs));
     return success();
@@ -2245,6 +2266,7 @@ LogicalResult MapElementwiseConverter::matchAndRewrite(
           loc, firstResultType.getDimSize(i)));
     }
   }
+  SmallVector<Value> outputs = createOutputs(upperBounds);
 
   if (pack > 1) {
     // Convert the linear element number used by the packed loop back to tensor

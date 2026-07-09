@@ -209,3 +209,27 @@ module attributes {hacc.target = #hacc.target<"Ascend910B2">} {
     return %0 : tensor<2x4xf32>
   }
 }
+
+
+// -----
+
+// CHECK-LABEL: func.func @map_elementwise_dynamic_add
+// CHECK: %[[DIM:.*]] = tensor.dim %{{.*}}, %c0 : tensor<?xi32>
+// CHECK: %[[EMPTY:.*]] = tensor.empty(%[[DIM]]) : tensor<?xi32>
+// CHECK: %[[LOOP:.*]] = scf.for %[[IV:.*]] = {{.*}} to %[[DIM]] step {{.*}} iter_args(%[[OUT:.*]] = %[[EMPTY]]) -> (tensor<?xi32>) {
+// CHECK: %[[X:.*]] = tensor.extract %{{.*}}[%[[IV]]] : tensor<?xi32>
+// CHECK: %[[Y:.*]] = tensor.extract %{{.*}}[%[[IV]]] : tensor<?xi32>
+// CHECK: %[[ADD:.*]] = arith.addi %[[X]], %[[Y]] : i32
+// CHECK: %[[INSERTED:.*]] = tensor.insert %[[ADD]] into %[[OUT]][%[[IV]]] : tensor<?xi32>
+// CHECK: scf.yield %[[INSERTED]] : tensor<?xi32>
+// CHECK: return %[[LOOP]] : tensor<?xi32>
+module attributes {hacc.target = #hacc.target<"Ascend910B2">} {
+  func.func @map_elementwise_dynamic_add(%arg0: tensor<?xi32>, %arg1: tensor<?xi32>) -> tensor<?xi32> {
+    %0 = "tt.map_elementwise"(%arg0, %arg1) ({
+    ^bb0(%x: i32, %y: i32):
+      %add = arith.addi %x, %y : i32
+      tt.map_elementwise.return %add : i32
+    }) {pack = 1 : i32} : (tensor<?xi32>, tensor<?xi32>) -> tensor<?xi32>
+    return %0 : tensor<?xi32>
+  }
+}
