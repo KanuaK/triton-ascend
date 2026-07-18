@@ -1,4 +1,8 @@
 add_triton_library(TritonControlFlowOpt
+        BlockPtrDecompose.cpp
+        CFGStructuring.cpp
+        ControlFlowRewrite.cpp
+        TensorPtrDecompose.cpp
         TritonControlFlowOptPass.cpp
 
   DEPENDS
