@@ -44,7 +44,20 @@ namespace {
 /// Loops currently carry only `offsets`; shape and strides must remain
 /// invariant across a backedge. An scf.if may select any component whose SSA
 /// value differs between its branches.
+///
+/// Keep rank/layout checks local to this file: the generic control-flow
+/// machinery intentionally does not know the descriptor format of a policy.
 static FailureOr<unsigned> getRank(const DecomposedValue &value) {
+  auto pointerType = dyn_cast<triton::PointerType>(value.originalType);
+  if (!pointerType)
+    return failure();
+  auto tensorType = dyn_cast<RankedTensorType>(pointerType.getPointeeType());
+  if (!tensorType)
+    return failure();
+  return tensorType.getRank();
+}
+
+static FailureOr<unsigned> getRank(const AnalyzedValue &value) {
   auto pointerType = dyn_cast<triton::PointerType>(value.originalType);
   if (!pointerType)
     return failure();
@@ -61,8 +74,30 @@ static bool hasValidLayout(const DecomposedValue &value) {
          isa<DenseI32ArrayAttr>(value.attributes.front());
 }
 
+static bool hasValidLayout(const AnalyzedValue &value) {
+  FailureOr<unsigned> rank = getRank(value);
+  return succeeded(rank) && value.components.size() == 3 * *rank &&
+         value.invariants.size() == 1 && value.attributes.size() == 1 &&
+         isa<DenseI32ArrayAttr>(value.attributes.front());
+}
+
+/// Returns the offset positions in the concrete block-pointer descriptor.
+/// This helper is used only by the optional IV closed-form materialization.
+static FailureOr<SmallVector<unsigned>>
+getBlockPtrOffsetComponents(const DecomposedValue &value) {
+  if (!hasValidLayout(value))
+    return failure();
+  unsigned rank = *getRank(value);
+  SmallVector<unsigned> indices;
+  for (unsigned dim = 0; dim < rank; ++dim)
+    indices.push_back(2 * rank + dim);
+  return indices;
+}
+
 static Value castIntegerLike(OpBuilder &builder, Location loc, Value value,
                              Type targetType) {
+  // Offset arithmetic may combine index, i32 and i64 values. Normalize the
+  // right-hand values to the component type selected by analysis.
   if (!value || value.getType() == targetType)
     return value;
 
@@ -100,20 +135,15 @@ static Value createMul(OpBuilder &builder, Location loc, Value lhs, Value rhs) {
   return builder.create<arith::MulIOp>(loc, lhs, rhs);
 }
 
-static bool haveSameTypes(ArrayRef<Value> lhs, ArrayRef<Value> rhs) {
-  return lhs.size() == rhs.size() &&
-         llvm::all_of(llvm::zip(lhs, rhs), [](auto values) {
-           return std::get<0>(values).getType() ==
-                  std::get<1>(values).getType();
-         });
-}
-
 static bool isConstantIndex(Value value, int64_t expected) {
   auto constant = value.getDefiningOp<arith::ConstantIndexOp>();
   return constant && constant.value() == expected;
 }
 
 static bool isDefinedOutside(Operation *scope, Value value) {
+  // Closed-form IV reconstruction is valid only when the per-iteration delta
+  // is loop invariant. Both captured SSA values and enclosing block arguments
+  // satisfy that requirement.
   if (Operation *defOp = value.getDefiningOp())
     return !scope->isAncestor(defOp);
 
@@ -133,9 +163,159 @@ public:
     return pointerType && isa<RankedTensorType>(pointerType.getPointeeType());
   }
 
-  FailureOr<DecomposedValue>
-  decompose(Value value, const ControlFlowRewriteContext &context,
-            OpBuilder &builder, Location loc) const override {
+  FailureOr<AnalyzedValue>
+  analyzeValue(Value value,
+               ControlFlowAnalysisContext &context) const override {
+    // Region arguments and control-flow results are installed by the generic
+    // analysis after merging their incoming abstract component states.
+    if (const AnalyzedValue *known = context.lookupValue(value)) {
+      if (!matches(known->originalType))
+        return failure();
+      return *known;
+    }
+
+    if (auto makePtr = value.getDefiningOp<triton::MakeTensorPtrOp>()) {
+      // make_tensor_ptr exposes the complete descriptor directly. Record only
+      // types and symbolic identities here; this phase must not create IR.
+      AnalyzedValue result;
+      result.originalType = value.getType();
+      unsigned componentIndex = 0;
+      auto appendComponents = [&](ValueRange values) {
+        for (Value component : values) {
+          result.components.push_back(
+              {component.getType(),
+               ComponentIdentity::fromValue(component, componentIndex++)});
+        }
+      };
+      appendComponents(makePtr.getShape());
+      appendComponents(makePtr.getStrides());
+      appendComponents(makePtr.getOffsets());
+      result.invariants.push_back(makePtr.getBase());
+      result.attributes.push_back(makePtr.getOrderAttr());
+      if (!hasValidLayout(result))
+        return failure();
+      return result;
+    }
+
+    auto advance = value.getDefiningOp<triton::AdvanceOp>();
+    if (!advance)
+      return failure();
+    // tt.advance preserves base/shape/strides/order and produces new offsets.
+    // Give those offsets identities tied to the result so a loop/if merge can
+    // detect that they differ without materializing arith.addi operations.
+    FailureOr<AnalyzedValue> result = context.analyzeValue(advance.getPtr());
+    if (failed(result) || !hasValidLayout(*result))
+      return failure();
+    unsigned rank = *getRank(*result);
+    if (advance.getOffsets().size() != rank)
+      return failure();
+    for (unsigned dimension = 0; dimension < rank; ++dimension) {
+      unsigned componentIndex = 2 * rank + dimension;
+      result->components[componentIndex].identity =
+          ComponentIdentity::fromValue(value, componentIndex);
+    }
+    result->originalType = value.getType();
+    return *result;
+  }
+
+  FailureOr<SmallVector<unsigned>>
+  getLoopCandidateComponents(const AnalyzedValue &value) const override {
+    if (!hasValidLayout(value))
+      return failure();
+    unsigned rank = *getRank(value);
+    SmallVector<unsigned> indices;
+    // Only the final rank entries (offsets) are legal loop-carried state in the
+    // current block-pointer model.
+    for (unsigned dimension = 0; dimension < rank; ++dimension)
+      indices.push_back(2 * rank + dimension);
+    return indices;
+  }
+
+  FailureOr<SmallVector<unsigned>>
+  getLoopTransferredComponents(const AnalyzedValue &initial,
+                               const AnalyzedValue &regionArgument,
+                               const AnalyzedValue &next) const override {
+    if (!hasValidLayout(initial) || !hasValidLayout(regionArgument) ||
+        !hasValidLayout(next) ||
+        initial.originalType != regionArgument.originalType ||
+        initial.originalType != next.originalType ||
+        initial.invariants != regionArgument.invariants ||
+        initial.invariants != next.invariants ||
+        initial.attributes != regionArgument.attributes ||
+        initial.attributes != next.attributes)
+      return failure();
+
+    unsigned rank = *getRank(initial);
+    // The current implementation does not expand shape or stride iter_args.
+    // Reject a loop that changes either instead of silently reconstructing a
+    // descriptor with stale values.
+    for (unsigned index = 0; index < 2 * rank; ++index) {
+      if (initial.components[index].type != next.components[index].type ||
+          initial.components[index].identity != next.components[index].identity)
+        return failure();
+    }
+
+    SmallVector<unsigned> transferred;
+    // An offset is carried only if the backedge state depends on the region
+    // argument. Constant/invariant offsets remain outside the loop signature.
+    for (unsigned dimension = 0; dimension < rank; ++dimension) {
+      unsigned index = 2 * rank + dimension;
+      if (failed(joinComponentTypes(initial.components[index].type,
+                                    next.components[index].type)))
+        return failure();
+      if (regionArgument.components[index].identity !=
+          next.components[index].identity)
+        transferred.push_back(index);
+    }
+    return transferred;
+  }
+
+  FailureOr<SmallVector<unsigned>>
+  getIfTransferredComponents(const AnalyzedValue &thenValue,
+                             const AnalyzedValue &elseValue) const override {
+    if (!hasValidLayout(thenValue) || !hasValidLayout(elseValue) ||
+        thenValue.originalType != elseValue.originalType ||
+        thenValue.invariants != elseValue.invariants ||
+        thenValue.attributes != elseValue.attributes ||
+        thenValue.components.size() != elseValue.components.size())
+      return failure();
+
+    // Unlike loops, an if can select shape, stride, or offset components. Base
+    // and order remain invariants because AdapterIR cannot represent a runtime
+    // selection between heterogeneous pointer descriptors.
+    SmallVector<unsigned> transferred;
+    for (unsigned index = 0; index < thenValue.components.size(); ++index) {
+      if (failed(joinComponentTypes(thenValue.components[index].type,
+                                    elseValue.components[index].type)))
+        return failure();
+      if (thenValue.components[index].identity !=
+          elseValue.components[index].identity)
+        transferred.push_back(index);
+    }
+    return transferred;
+  }
+
+  FailureOr<Type> joinComponentTypes(Type lhs, Type rhs) const override {
+    // Block-pointer descriptor operands must have identical types on all
+    // incoming paths. Tensor-pointer offsets use a more permissive integer
+    // width join in their own policy.
+    if (lhs != rhs)
+      return failure();
+    return lhs;
+  }
+
+  bool shouldDecomposeOperation(Operation *op) const override {
+    // Recording each cloned advance lets downstream advances reuse its
+    // flattened descriptor rather than walking through the rebuilt pointer.
+    return isa<triton::AdvanceOp>(op);
+  }
+
+  FailureOr<DecomposedValue> decompose(Value value,
+                                       const ControlFlowRewriteContext &context,
+                                       OpBuilder &builder,
+                                       Location loc) const override {
+    // Prefer decompositions recorded while rebuilding the enclosing region;
+    // this is how analysis results cross nested SCF boundaries at rewrite time.
     if (const DecomposedValue *known = context.lookup(value)) {
       if (!matches(known->originalType))
         return failure();
@@ -144,6 +324,7 @@ public:
 
     value = context.remap(value);
     if (auto makePtr = value.getDefiningOp<triton::MakeTensorPtrOp>()) {
+      // Materialize the concrete counterpart of analyzeValue's descriptor.
       DecomposedValue result;
       result.originalType = value.getType();
       result.components.append(makePtr.getShape().begin(),
@@ -171,13 +352,15 @@ public:
     if (advance.getOffsets().size() != *rank)
       return failure();
 
+    // Flatten an advance into offset arithmetic at the original operation's
+    // position. Base, shape, strides, and order are inherited unchanged.
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPoint(advance);
     for (auto [dim, delta] : llvm::enumerate(advance.getOffsets())) {
       unsigned component = 2 * *rank + dim;
-      Value offset = createAdd(builder, advance.getLoc(),
-                               result->components[component],
-                               context.remap(delta));
+      Value offset =
+          createAdd(builder, advance.getLoc(), result->components[component],
+                    context.remap(delta));
       if (!offset)
         return failure();
       result->components[component] = offset;
@@ -188,6 +371,8 @@ public:
 
   Value recompose(const DecomposedValue &value, OpBuilder &builder,
                   Location loc) const override {
+    // Rebuild the original pointer type immediately inside/after the rewritten
+    // control-flow boundary so ordinary users remain untouched.
     if (!hasValidLayout(value))
       return nullptr;
     unsigned rank = *getRank(value);
@@ -199,76 +384,20 @@ public:
         ValueRange(value.components).take_back(rank), order);
   }
 
-  FailureOr<SmallVector<unsigned>>
-  getLoopComponentIndices(const DecomposedValue &value) const override {
-    if (!hasValidLayout(value))
-      return failure();
-    unsigned rank = *getRank(value);
-    SmallVector<unsigned> indices;
-    for (unsigned dim = 0; dim < rank; ++dim)
-      indices.push_back(2 * rank + dim);
-    return indices;
-  }
-
-  bool areLoopStatesCompatible(const DecomposedValue &initial,
-                               const DecomposedValue &next) const override {
-    if (!hasValidLayout(initial) || !hasValidLayout(next) ||
-        initial.originalType != next.originalType ||
-        initial.invariants != next.invariants ||
-        initial.attributes != next.attributes)
-      return false;
-
-    unsigned rank = *getRank(initial);
-    ArrayRef<Value> initialStatic(initial.components.data(), 2 * rank);
-    ArrayRef<Value> nextStatic(next.components.data(), 2 * rank);
-    ArrayRef<Value> initialOffsets(initial.components.data() + 2 * rank, rank);
-    ArrayRef<Value> nextOffsets(next.components.data() + 2 * rank, rank);
-    return initialStatic == nextStatic &&
-           haveSameTypes(initialOffsets, nextOffsets);
-  }
-
-  FailureOr<SmallVector<unsigned>>
-  getIfComponentIndices(const DecomposedValue &thenValue,
-                        const DecomposedValue &elseValue) const override {
-    if (!hasValidLayout(thenValue) || !hasValidLayout(elseValue) ||
-        thenValue.originalType != elseValue.originalType ||
-        thenValue.invariants != elseValue.invariants ||
-        thenValue.attributes != elseValue.attributes ||
-        thenValue.components.size() != elseValue.components.size())
-      return failure();
-
-    SmallVector<unsigned> indices;
-    for (auto [index, values] :
-         llvm::enumerate(llvm::zip(thenValue.components,
-                                  elseValue.components))) {
-      Value thenComponent = std::get<0>(values);
-      Value elseComponent = std::get<1>(values);
-      if (thenComponent == elseComponent)
-        continue;
-      if (thenComponent.getType() != elseComponent.getType())
-        return failure();
-      indices.push_back(index);
-    }
-    return indices;
-  }
-
-  bool shouldDecomposeOperation(Operation *op) const override {
-    return isa<triton::AdvanceOp>(op);
-  }
-
   FailureOr<SmallVector<Value>>
-  matchForInductionDeltas(scf::ForOp forOp,
-                          const DecomposedValue &initial,
+  matchForInductionDeltas(scf::ForOp forOp, const DecomposedValue &initial,
                           unsigned iterArgIndex,
                           Value yieldOperand) const override {
+    // Recognize the narrow closed form:
+    //   offset(iv) = initial_offset + iv * invariant_delta
+    // for loops whose IV is also their zero-based iteration count.
     if (!hasValidLayout(initial) ||
         !isConstantIndex(forOp.getLowerBound(), 0) ||
         !isConstantIndex(forOp.getStep(), 1))
       return failure();
 
     auto advance = yieldOperand.getDefiningOp<triton::AdvanceOp>();
-    if (!advance ||
-        advance.getPtr() != forOp.getRegionIterArgs()[iterArgIndex])
+    if (!advance || advance.getPtr() != forOp.getRegionIterArgs()[iterArgIndex])
       return failure();
 
     unsigned rank = *getRank(initial);
@@ -294,10 +423,12 @@ public:
                           const ControlFlowRewriteContext &context,
                           OpBuilder &builder, Location loc) const override {
     FailureOr<SmallVector<unsigned>> indices =
-        getLoopComponentIndices(initial);
+        getBlockPtrOffsetComponents(initial);
     if (failed(indices) || indices->size() != deltas.size())
       return failure();
 
+    // This is an optional reconstruction optimization only. Failure falls back
+    // to the offset values carried explicitly by the rewritten loop.
     DecomposedValue result = initial;
     for (auto [component, delta] : llvm::zip(*indices, deltas)) {
       Type type = result.components[component].getType();

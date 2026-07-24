@@ -37,6 +37,8 @@ namespace mlir::triton {
 
 void TritonControlFlowOptPass::getDependentDialects(
     DialectRegistry &registry) const {
+  // CFG structuring creates SCF operations, while pointer decomposition
+  // materializes arith and Triton pointer operations.
   registry.insert<arith::ArithDialect, cf::ControlFlowDialect,
                   func::FuncDialect, scf::SCFDialect, triton::TritonDialect>();
 }
@@ -62,6 +64,8 @@ void TritonControlFlowOptPass::runOnOperation() {
 }
 
 std::unique_ptr<OperationPass<ModuleOp>> createTritonControlFlowOptPass() {
+  // Keep construction in this translation unit; registration is generated
+  // from Passes.td and exposes only this public factory.
   return std::make_unique<TritonControlFlowOptPass>();
 }
 

@@ -23,6 +23,8 @@
 #ifndef TRITON_ASCEND_TRITON_CONTROL_FLOW_OPT_CONTROL_FLOW_REWRITE_H
 #define TRITON_ASCEND_TRITON_CONTROL_FLOW_OPT_CONTROL_FLOW_REWRITE_H
 
+#include "TritonControlFlowOpt/ControlFlowAnalysis.h"
+
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -71,11 +73,13 @@ private:
 /// cross loop/if boundaries, and whether two decompositions share a compatible
 /// invariant schema. It is not an IR marker and carries no state between
 /// policy invocations.
-class ControlFlowRewritePolicy {
+class ControlFlowRewritePolicy : public ControlFlowAnalysisPolicy {
 public:
   virtual ~ControlFlowRewritePolicy() = default;
 
-  virtual bool matches(Type type) const = 0;
+  /// Whether results of this ordinary operation need immediate decomposition
+  /// after cloning so later operations can reuse their exact component state.
+  virtual bool shouldDecomposeOperation(Operation *op) const = 0;
 
   virtual FailureOr<DecomposedValue>
   decompose(Value value, const ControlFlowRewriteContext &context,
@@ -84,41 +88,36 @@ public:
   virtual Value recompose(const DecomposedValue &value, OpBuilder &builder,
                           Location loc) const = 0;
 
-  /// Returns component indices carried in place of a loop iter-argument.
-  virtual FailureOr<SmallVector<unsigned>>
-  getLoopComponentIndices(const DecomposedValue &value) const = 0;
-
-  virtual bool areLoopStatesCompatible(const DecomposedValue &initial,
-                                       const DecomposedValue &next) const = 0;
-
-  /// Validates an if-merge and returns the components selected by the if.
-  virtual FailureOr<SmallVector<unsigned>>
-  getIfComponentIndices(const DecomposedValue &thenValue,
-                        const DecomposedValue &elseValue) const = 0;
-
-  /// Whether results of this ordinary operation need immediate decomposition
-  /// after cloning so later operations can reuse their exact component state.
-  virtual bool shouldDecomposeOperation(Operation *op) const = 0;
-
   /// Optional block-pointer closed form used for zero-based unit-step loops.
   virtual FailureOr<SmallVector<Value>>
-  matchForInductionDeltas(scf::ForOp forOp,
-                          const DecomposedValue &initial,
-                          unsigned iterArgIndex, Value yieldOperand) const = 0;
+  matchForInductionDeltas(scf::ForOp, const DecomposedValue &, unsigned,
+                          Value) const {
+    return failure();
+  }
 
   virtual FailureOr<DecomposedValue>
-  applyForInductionDeltas(const DecomposedValue &initial,
-                          ArrayRef<Value> deltas, Value inductionVar,
-                          const ControlFlowRewriteContext &context,
-                          OpBuilder &builder, Location loc) const = 0;
+  applyForInductionDeltas(const DecomposedValue &, ArrayRef<Value>, Value,
+                          const ControlFlowRewriteContext &, OpBuilder &,
+                          Location) const {
+    return failure();
+  }
 };
 
 /// Rewrites supported SCF operations from outermost to innermost.
 ///
-/// This function owns the mechanical control-flow work: signature expansion,
-/// region cloning, terminator rewriting, nested recursion and result
-/// replacement. Pointer semantics remain selected by `policy` so the two
-/// policies do not duplicate the SCF plumbing.
+/// Applies a previously frozen plan without running value analysis again.
+/// Signature expansion, region cloning, terminator rewriting, nested recursion
+/// and result replacement are driven solely by operation-level decisions in
+/// `plan`.
+LogicalResult
+applyControlFlowRewritePlan(ModuleOp module,
+                            const ControlFlowRewritePolicy &policy,
+                            const ControlFlowRewritePlan &plan);
+
+/// Analyzes the complete decomposition stage before mutating the IR, then
+/// applies the frozen plan from outermost to innermost. Pointer semantics
+/// remain selected by `policy` so different decompositions share the same SCF
+/// plumbing.
 LogicalResult rewriteControlFlow(ModuleOp module,
                                  const ControlFlowRewritePolicy &policy);
 

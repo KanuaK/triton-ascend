@@ -22,6 +22,7 @@
 
 #include "TritonControlFlowOpt/ControlFlowRewrite.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
@@ -31,9 +32,14 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <optional>
+
 using namespace mlir;
+using mlir::triton::controlflow::ControlFlowOpAnalysis;
 using mlir::triton::controlflow::ControlFlowRewriteContext;
+using mlir::triton::controlflow::ControlFlowRewritePlan;
 using mlir::triton::controlflow::ControlFlowRewritePolicy;
+using mlir::triton::controlflow::ControlFlowSlotAnalysis;
 using mlir::triton::controlflow::DecomposedValue;
 
 namespace mlir::triton::controlflow {
@@ -65,12 +71,17 @@ namespace {
 //===----------------------------------------------------------------------===//
 
 struct RewriteEnv {
-  explicit RewriteEnv(const ControlFlowRewritePolicy &policy)
-      : policy(policy) {}
+  RewriteEnv(const ControlFlowRewritePolicy &policy,
+             const ControlFlowRewritePlan &plan)
+      : policy(policy), plan(plan) {}
 
+  // Maps values from the original region to values in the replacement region.
   IRMapping valueMapping;
+  // Concrete component state keyed by original values. Keeping this alongside
+  // the mapping lets pointer producers be flattened across nested rewrites.
   DenseMap<Value, DecomposedValue> decomposedValues;
   const ControlFlowRewritePolicy &policy;
+  const ControlFlowRewritePlan &plan;
 };
 
 // RewriteEnv is copied when entering a newly built region. The copy inherits
@@ -79,18 +90,24 @@ struct RewriteEnv {
 // decomposition policies.
 
 struct LoopPointerInfo {
+  // Original iter-argument/result position before signature expansion.
   unsigned oldIndex = 0;
+  // Concrete descriptor used as the reconstruction template.
   DecomposedValue initInfo;
+  // Ordered schema decided by ControlFlowSlotAnalysis.
   SmallVector<unsigned> componentIndices;
+  SmallVector<Type> componentTypes;
+  // Positions occupied by those components in the replacement operation.
   SmallVector<unsigned> newIndices;
+  // Optional closed-form deltas recognized by the block-pointer policy.
   SmallVector<Value> ivDeltas;
 };
 
 struct IfPointerInfo {
   unsigned oldIndex = 0;
-  DecomposedValue thenInfo;
-  DecomposedValue elseInfo;
   SmallVector<unsigned> componentIndices;
+  SmallVector<Type> componentTypes;
+  std::optional<DecomposedValue> thenInfo;
 };
 
 static Value remapValue(Value value, const RewriteEnv &env) {
@@ -98,23 +115,23 @@ static Value remapValue(Value value, const RewriteEnv &env) {
       .remap(value);
 }
 
-static FailureOr<DecomposedValue>
-decompose(Value value, const RewriteEnv &env, OpBuilder &builder,
-          Location loc) {
+static FailureOr<DecomposedValue> decompose(Value value, const RewriteEnv &env,
+                                            OpBuilder &builder, Location loc) {
   return env.policy.decompose(
       value, ControlFlowRewriteContext(env.valueMapping, env.decomposedValues),
       builder, loc);
 }
 
 static void recordDecomposition(Value oldValue, const DecomposedValue &info,
-                                Value rebuiltValue,
-                                RewriteEnv &env) {
+                                Value rebuiltValue, RewriteEnv &env) {
   env.decomposedValues[oldValue] = info;
   env.valueMapping.map(oldValue, rebuiltValue);
 }
 
-static SmallVector<Value>
-getComponentValues(const DecomposedValue &info, ArrayRef<unsigned> indices) {
+static SmallVector<Value> getComponentValues(const DecomposedValue &info,
+                                             ArrayRef<unsigned> indices) {
+  // Callers validate the policy-provided indices before reaching this helper.
+  // Preserve their order because it is also the replacement signature order.
   SmallVector<Value> values;
   values.reserve(indices.size());
   for (unsigned index : indices)
@@ -125,6 +142,8 @@ getComponentValues(const DecomposedValue &info, ArrayRef<unsigned> indices) {
 static FailureOr<DecomposedValue>
 withComponentValues(DecomposedValue info, ArrayRef<unsigned> indices,
                     ArrayRef<Value> values) {
+  // Start from one branch/init descriptor and replace only the components that
+  // crossed the boundary. Invariants never enter the generic SCF signature.
   if (indices.size() != values.size())
     return failure();
   for (auto [index, value] : llvm::zip(indices, values)) {
@@ -134,6 +153,62 @@ withComponentValues(DecomposedValue info, ArrayRef<unsigned> indices,
     info.components[index] = value;
   }
   return info;
+}
+
+static Value castComponent(OpBuilder &builder, Location loc, Value value,
+                           Type targetType) {
+  // Analysis chooses one joined integer width for each transferred component.
+  // Materialization inserts the corresponding scalar or tensor integer cast.
+  if (!value || value.getType() == targetType)
+    return value;
+
+  Type sourceType = value.getType();
+  if ((sourceType.isIndex() && isa<IntegerType>(targetType)) ||
+      (isa<IntegerType>(sourceType) && targetType.isIndex()))
+    return builder.create<arith::IndexCastOp>(loc, targetType, value);
+
+  auto sourceInteger = dyn_cast<IntegerType>(sourceType);
+  auto targetInteger = dyn_cast<IntegerType>(targetType);
+  if (sourceInteger && targetInteger) {
+    if (sourceInteger.getWidth() < targetInteger.getWidth())
+      return builder.create<arith::ExtSIOp>(loc, targetType, value);
+    if (sourceInteger.getWidth() > targetInteger.getWidth())
+      return builder.create<arith::TruncIOp>(loc, targetType, value);
+    return value;
+  }
+
+  auto sourceTensor = dyn_cast<RankedTensorType>(sourceType);
+  auto targetTensor = dyn_cast<RankedTensorType>(targetType);
+  if (!sourceTensor || !targetTensor ||
+      sourceTensor.getShape() != targetTensor.getShape())
+    return nullptr;
+  auto sourceElement = dyn_cast<IntegerType>(sourceTensor.getElementType());
+  auto targetElement = dyn_cast<IntegerType>(targetTensor.getElementType());
+  if (!sourceElement || !targetElement)
+    return nullptr;
+  if (sourceElement.getWidth() < targetElement.getWidth())
+    return builder.create<arith::ExtSIOp>(loc, targetType, value);
+  if (sourceElement.getWidth() > targetElement.getWidth())
+    return builder.create<arith::TruncIOp>(loc, targetType, value);
+  return value;
+}
+
+static LogicalResult castPlannedComponents(DecomposedValue &value,
+                                           ArrayRef<unsigned> componentIndices,
+                                           ArrayRef<Type> componentTypes,
+                                           OpBuilder &builder, Location loc) {
+  if (componentIndices.size() != componentTypes.size())
+    return failure();
+  for (auto [index, type] : llvm::zip(componentIndices, componentTypes)) {
+    if (index >= value.components.size())
+      return failure();
+    Value component =
+        castComponent(builder, loc, value.components[index], type);
+    if (!component)
+      return failure();
+    value.components[index] = component;
+  }
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -161,6 +236,8 @@ static const LoopPointerInfo *findLoopInfo(ArrayRef<LoopPointerInfo> infos,
 static SmallVector<Value> collectForComponents(const LoopPointerInfo &info,
                                                scf::ForOp forOp,
                                                bool useResults) {
+  // `newIndices` is shared by init operands, region arguments and results of an
+  // scf.for, so choosing the source is sufficient to recover the descriptor.
   SmallVector<Value> values;
   for (unsigned newIndex : info.newIndices)
     values.push_back(useResults ? forOp.getResult(newIndex)
@@ -172,6 +249,8 @@ static SmallVector<Value> collectWhileComponents(const LoopPointerInfo &info,
                                                  scf::WhileOp whileOp,
                                                  bool useResults,
                                                  bool useAfterArgs) {
+  // scf.while has two region-argument lists in addition to its results; all
+  // three use the same expanded positional schema.
   SmallVector<Value> values;
   for (unsigned newIndex : info.newIndices) {
     if (useResults)
@@ -201,13 +280,13 @@ static LogicalResult materializePointerResult(Operation &bodyOp,
 
   for (auto [oldResult, clonedResult] :
        llvm::zip(bodyOp.getResults(), clonedOp->getResults())) {
-    if (!env.policy.matches(oldResult.getType()))
+    if (!env.policy.isDecompositionTarget(oldResult))
       continue;
 
     FailureOr<DecomposedValue> info =
         decompose(clonedResult, env, builder, oldResult.getLoc());
     if (failed(info))
-      continue;
+      return failure();
 
     Value rebuilt = env.policy.recompose(*info, builder, oldResult.getLoc());
     if (!rebuilt)
@@ -224,12 +303,16 @@ static LogicalResult rewriteBodyOps(Block *oldBlock, OpBuilder &builder,
   // recursively with the same policy; ordinary operations are cloned through
   // the current SSA mapping.
   for (Operation &bodyOp : oldBlock->without_terminator()) {
-    // TODO: Distinguish "no slot owned by this policy" from "owned slot failed
-    // to rewrite". The latter must fail the enclosing rewrite instead of
-    // cloning an opaque nested control-flow operation.
-    if (isa<scf::ForOp, scf::WhileOp, scf::IfOp>(bodyOp) &&
-        succeeded(rewriteControlFlowOp(&bodyOp, builder, env)))
-      continue;
+    if (isa<scf::ForOp, scf::WhileOp, scf::IfOp>(bodyOp)) {
+      const ControlFlowOpAnalysis *analysis = env.plan.lookup(&bodyOp);
+      if (!analysis)
+        return failure();
+      if (analysis->needsRewrite()) {
+        if (failed(rewriteControlFlowOp(&bodyOp, builder, env)))
+          return failure();
+        continue;
+      }
+    }
     Operation *clonedOp = builder.clone(bodyOp, env.valueMapping);
     if (failed(materializePointerResult(bodyOp, clonedOp, builder, env)))
       return failure();
@@ -243,41 +326,35 @@ static LogicalResult rewriteBodyOps(Block *oldBlock, OpBuilder &builder,
 
 static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
                                   RewriteEnv &env) {
+  const ControlFlowOpAnalysis *analysis = env.plan.lookup(forOp);
+  if (!analysis || !analysis->needsRewrite())
+    return failure();
   auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
   SmallVector<LoopPointerInfo, 4> pointerInfos;
 
-  // First determine which old iter-argument slots belong to this policy and
-  // recover the exact component schema from their init values.
-  OpBuilder analysisBuilder(forOp.getContext());
-  analysisBuilder.setInsertionPoint(forOp);
-
-  for (auto [idx, iterArg] : llvm::enumerate(forOp.getRegionIterArgs())) {
-    if (!env.policy.matches(iterArg.getType()))
-      continue;
-    if (idx >= forOp.getInitArgs().size() || idx >= yieldOp.getNumOperands())
+  // The read-only analysis has already fixed every expanded slot and type.
+  // Materialization here recovers only the concrete values for that schema.
+  for (const ControlFlowSlotAnalysis &slot : analysis->slots) {
+    unsigned idx = slot.oldIndex;
+    if (idx >= forOp.getInitArgs().size() || idx >= yieldOp.getNumOperands() ||
+        !env.policy.matches(forOp.getRegionIterArgs()[idx].getType()))
       return failure();
 
     FailureOr<DecomposedValue> initInfo =
-        decompose(forOp.getInitArgs()[idx], env, analysisBuilder,
-                  forOp.getLoc());
-    if (failed(initInfo))
-      continue;
-    FailureOr<SmallVector<unsigned>> componentIndices =
-        env.policy.getLoopComponentIndices(*initInfo);
-    if (failed(componentIndices))
-      continue;
-    pointerInfos.push_back(LoopPointerInfo{static_cast<unsigned>(idx),
-                                           *initInfo, *componentIndices, {}});
+        decompose(forOp.getInitArgs()[idx], env, builder, forOp.getLoc());
+    if (failed(initInfo) || failed(castPlannedComponents(
+                                *initInfo, slot.componentIndices,
+                                slot.componentTypes, builder, forOp.getLoc())))
+      return failure();
+    pointerInfos.push_back(LoopPointerInfo{
+        idx, *initInfo, slot.componentIndices, slot.componentTypes, {}, {}});
   }
 
-  if (pointerInfos.empty())
-    return failure();
-
+  // Closed-form IV reconstruction is optional and never changes the analyzed
+  // loop signature. If matching fails, explicit carried components are used.
   for (LoopPointerInfo &info : pointerInfos) {
-    FailureOr<SmallVector<Value>> deltas =
-        env.policy.matchForInductionDeltas(
-            forOp, info.initInfo, info.oldIndex,
-            yieldOp.getOperand(info.oldIndex));
+    FailureOr<SmallVector<Value>> deltas = env.policy.matchForInductionDeltas(
+        forOp, info.initInfo, info.oldIndex, yieldOp.getOperand(info.oldIndex));
     if (succeeded(deltas))
       info.ivDeltas = *deltas;
   }
@@ -345,15 +422,16 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
           bodyOk = false;
 
         SmallVector<Value> newYieldOperands;
-        // Decompose yielded pointers back into the expanded component order.
-        // Compatibility guards the loop-carried schema across the backedge.
+        // Decompose yielded pointers back into the component order selected by
+        // the read-only loop analysis.
         for (auto [idx, oldOperand] : llvm::enumerate(yieldOp.getOperands())) {
           if (const LoopPointerInfo *info = findLoopInfo(pointerInfos, idx)) {
-            FailureOr<DecomposedValue> nextInfo = decompose(
-                oldOperand, bodyEnv, bodyBuilder, yieldOp.getLoc());
+            FailureOr<DecomposedValue> nextInfo =
+                decompose(oldOperand, bodyEnv, bodyBuilder, yieldOp.getLoc());
             if (failed(nextInfo) ||
-                !env.policy.areLoopStatesCompatible(info->initInfo,
-                                                    *nextInfo)) {
+                failed(castPlannedComponents(*nextInfo, info->componentIndices,
+                                             info->componentTypes, bodyBuilder,
+                                             yieldOp.getLoc()))) {
               bodyOk = false;
               for (unsigned newIndex : info->newIndices)
                 newYieldOperands.push_back(args[newIndex]);
@@ -382,8 +460,7 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
   for (auto [idx, oldResult] : llvm::enumerate(forOp.getResults())) {
     if (const LoopPointerInfo *info = findLoopInfo(pointerInfos, idx)) {
       FailureOr<DecomposedValue> resultInfo = withComponentValues(
-          info->initInfo,
-          info->componentIndices,
+          info->initInfo, info->componentIndices,
           collectForComponents(*info, newForOp, /*useResults=*/true));
       if (failed(resultInfo)) {
         newForOp.erase();
@@ -410,38 +487,36 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
 
 static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
                                     RewriteEnv &env) {
+  const ControlFlowOpAnalysis *analysis = env.plan.lookup(whileOp);
+  if (!analysis || !analysis->needsRewrite())
+    return failure();
   scf::ConditionOp conditionOp = whileOp.getConditionOp();
   scf::YieldOp yieldOp = whileOp.getYieldOp();
   SmallVector<LoopPointerInfo, 4> pointerInfos;
 
   // The before arguments, condition forwarded values, after arguments and
-  // yield operands all share one positional schema. Analyze that schema from
-  // the initial values before creating either replacement region.
-  OpBuilder analysisBuilder(whileOp.getContext());
-  analysisBuilder.setInsertionPoint(whileOp);
-
-  for (auto [idx, beforeArg] : llvm::enumerate(whileOp.getBeforeArguments())) {
-    if (!env.policy.matches(beforeArg.getType()))
-      continue;
-    if (idx >= whileOp.getInits().size() ||
+  // yield operands all consume the same precomputed positional schema.
+  for (const ControlFlowSlotAnalysis &slot : analysis->slots) {
+    unsigned idx = slot.oldIndex;
+    if (idx >= whileOp.getBeforeArguments().size() ||
+        !env.policy.matches(whileOp.getBeforeArguments()[idx].getType()) ||
+        idx >= whileOp.getInits().size() ||
         idx >= conditionOp.getArgs().size() || idx >= yieldOp.getNumOperands())
       return failure();
 
-    FailureOr<DecomposedValue> initInfo = decompose(
-        whileOp.getInits()[idx], env, analysisBuilder, whileOp.getLoc());
-    if (failed(initInfo))
-      continue;
-    FailureOr<SmallVector<unsigned>> componentIndices =
-        env.policy.getLoopComponentIndices(*initInfo);
-    if (failed(componentIndices))
-      continue;
-    pointerInfos.push_back(LoopPointerInfo{static_cast<unsigned>(idx),
-                                           *initInfo, *componentIndices, {}});
+    FailureOr<DecomposedValue> initInfo =
+        decompose(whileOp.getInits()[idx], env, builder, whileOp.getLoc());
+    if (failed(initInfo) ||
+        failed(castPlannedComponents(*initInfo, slot.componentIndices,
+                                     slot.componentTypes, builder,
+                                     whileOp.getLoc())))
+      return failure();
+    pointerInfos.push_back(LoopPointerInfo{
+        idx, *initInfo, slot.componentIndices, slot.componentTypes, {}, {}});
   }
 
-  if (pointerInfos.empty())
-    return failure();
-
+  // Expand inits and result types in lockstep. oldToNewStart keeps untouched
+  // positions addressable even when earlier pointer slots expand by rank.
   SmallVector<Value> newInits;
   SmallVector<Type> newResultTypes;
   SmallVector<unsigned> oldToNewStart(whileOp.getInits().size(), 0);
@@ -497,11 +572,12 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
         SmallVector<Value> newConditionArgs;
         for (auto [idx, oldArg] : llvm::enumerate(conditionOp.getArgs())) {
           if (const LoopPointerInfo *info = findLoopInfo(pointerInfos, idx)) {
-            FailureOr<DecomposedValue> conditionInfo = decompose(
-                oldArg, beforeEnv, bodyBuilder, conditionOp.getLoc());
+            FailureOr<DecomposedValue> conditionInfo =
+                decompose(oldArg, beforeEnv, bodyBuilder, conditionOp.getLoc());
             if (failed(conditionInfo) ||
-                !env.policy.areLoopStatesCompatible(info->initInfo,
-                                                    *conditionInfo)) {
+                failed(castPlannedComponents(
+                    *conditionInfo, info->componentIndices,
+                    info->componentTypes, bodyBuilder, conditionOp.getLoc()))) {
               bodyOk = false;
               for (unsigned newIndex : info->newIndices)
                 newConditionArgs.push_back(args[newIndex]);
@@ -554,11 +630,12 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
         SmallVector<Value> newYieldOperands;
         for (auto [idx, oldOperand] : llvm::enumerate(yieldOp.getOperands())) {
           if (const LoopPointerInfo *info = findLoopInfo(pointerInfos, idx)) {
-            FailureOr<DecomposedValue> nextInfo = decompose(
-                oldOperand, afterEnv, bodyBuilder, yieldOp.getLoc());
+            FailureOr<DecomposedValue> nextInfo =
+                decompose(oldOperand, afterEnv, bodyBuilder, yieldOp.getLoc());
             if (failed(nextInfo) ||
-                !env.policy.areLoopStatesCompatible(info->initInfo,
-                                                    *nextInfo)) {
+                failed(castPlannedComponents(*nextInfo, info->componentIndices,
+                                             info->componentTypes, bodyBuilder,
+                                             yieldOp.getLoc()))) {
               bodyOk = false;
               for (unsigned newIndex : info->newIndices)
                 newYieldOperands.push_back(args[newIndex]);
@@ -585,8 +662,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
   for (auto [idx, oldResult] : llvm::enumerate(whileOp.getResults())) {
     if (const LoopPointerInfo *info = findLoopInfo(pointerInfos, idx)) {
       FailureOr<DecomposedValue> resultInfo = withComponentValues(
-          info->initInfo,
-          info->componentIndices,
+          info->initInfo, info->componentIndices,
           collectWhileComponents(*info, newWhileOp, /*useResults=*/true,
                                  /*useAfterArgs=*/false));
       if (failed(resultInfo)) {
@@ -608,60 +684,18 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
   return success();
 }
 
-static FailureOr<DecomposedValue>
-analyzeValueForIfPlanning(Value value, const RewriteEnv &env,
-                          OpBuilder &builder, Location loc);
-
-static FailureOr<DecomposedValue>
-analyzeNestedIfResultForPlanning(scf::IfOp ifOp, unsigned resultIndex,
-                                 const RewriteEnv &env, OpBuilder &builder,
-                                 Location loc) {
-  // Planning an outer operation may reach a result of an inner scf.if before
-  // that inner operation has been cloned. Inspect the two yields directly so
-  // outer-first rewriting can still determine the pointer schema.
-  if (!ifOp.elseBlock() || resultIndex >= ifOp.getNumResults())
-    return failure();
-
-  scf::YieldOp thenYield = ifOp.thenYield();
-  scf::YieldOp elseYield = ifOp.elseYield();
-  if (resultIndex >= thenYield.getNumOperands() ||
-      resultIndex >= elseYield.getNumOperands())
-    return failure();
-
-  FailureOr<DecomposedValue> thenInfo = analyzeValueForIfPlanning(
-      thenYield.getOperand(resultIndex), env, builder, loc);
-  FailureOr<DecomposedValue> elseInfo = analyzeValueForIfPlanning(
-      elseYield.getOperand(resultIndex), env, builder, loc);
-  if (failed(thenInfo) || failed(elseInfo) ||
-      failed(env.policy.getIfComponentIndices(*thenInfo, *elseInfo)))
-    return failure();
-  return *thenInfo;
-}
-
-static FailureOr<DecomposedValue>
-analyzeValueForIfPlanning(Value value, const RewriteEnv &env,
-                          OpBuilder &builder, Location loc) {
-  if (auto it = env.decomposedValues.find(value);
-      it != env.decomposedValues.end())
-    return it->second;
-
-  Value mapped = remapValue(value, env);
-  if (auto result = dyn_cast<OpResult>(mapped)) {
-    if (auto nestedIf = dyn_cast<scf::IfOp>(result.getOwner())) {
-      FailureOr<DecomposedValue> nestedInfo =
-          analyzeNestedIfResultForPlanning(
-              nestedIf, result.getResultNumber(), env, builder, loc);
-      if (succeeded(nestedInfo))
-        return nestedInfo;
-    }
-  }
-
-  return decompose(value, env, builder, loc);
-}
-
 //===----------------------------------------------------------------------===//
 // scf.if component planning and rewrite
 //===----------------------------------------------------------------------===//
+
+static IfPointerInfo *findIfInfo(SmallVectorImpl<IfPointerInfo> &infos,
+                                 unsigned oldIndex) {
+  for (IfPointerInfo &info : infos) {
+    if (info.oldIndex == oldIndex)
+      return &info;
+  }
+  return nullptr;
+}
 
 static const IfPointerInfo *findIfInfo(ArrayRef<IfPointerInfo> infos,
                                        unsigned oldIndex) {
@@ -674,60 +708,39 @@ static const IfPointerInfo *findIfInfo(ArrayRef<IfPointerInfo> infos,
 
 static LogicalResult rewriteIfOp(scf::IfOp ifOp, OpBuilder &builder,
                                  RewriteEnv &env) {
-  if (!ifOp.elseBlock() || ifOp->getNumResults() == 0)
+  const ControlFlowOpAnalysis *analysis = env.plan.lookup(ifOp);
+  if (!analysis || !analysis->needsRewrite() ||
+      (!ifOp.elseBlock() && analysis->rewritesOwnSignature()))
     return failure();
 
+  bool hasElse = static_cast<bool>(ifOp.elseBlock());
   scf::YieldOp thenYield = ifOp.thenYield();
-  scf::YieldOp elseYield = ifOp.elseYield();
+  scf::YieldOp elseYield = hasElse ? ifOp.elseYield() : scf::YieldOp();
   SmallVector<IfPointerInfo, 4> pointerInfos;
 
-  OpBuilder analysisBuilder(ifOp.getContext());
-  analysisBuilder.setInsertionPoint(ifOp);
-
-  // Decide the complete result signature before creating the replacement op.
-  // Components shared by both branches remain invariants outside the if;
-  // only components whose SSA values differ become new scf.if results.
-  for (auto [idx, result] : llvm::enumerate(ifOp.getResults())) {
-    if (!env.policy.matches(result.getType()))
-      continue;
-    if (thenYield.getOperand(idx) == elseYield.getOperand(idx))
-      continue;
-
-    FailureOr<DecomposedValue> thenInfo = analyzeValueForIfPlanning(
-        thenYield.getOperand(idx), env, analysisBuilder, thenYield.getLoc());
-    FailureOr<DecomposedValue> elseInfo = analyzeValueForIfPlanning(
-        elseYield.getOperand(idx), env, analysisBuilder, elseYield.getLoc());
-    if (failed(thenInfo) || failed(elseInfo))
-      continue;
-
-    IfPointerInfo info;
-    info.oldIndex = idx;
-    info.thenInfo = *thenInfo;
-    info.elseInfo = *elseInfo;
-    FailureOr<SmallVector<unsigned>> componentIndices =
-        env.policy.getIfComponentIndices(info.thenInfo, info.elseInfo);
-    if (failed(componentIndices))
-      continue;
-    info.componentIndices = *componentIndices;
-    pointerInfos.push_back(info);
+  for (const ControlFlowSlotAnalysis &slot : analysis->slots) {
+    if (slot.oldIndex >= ifOp.getNumResults() ||
+        !env.policy.matches(ifOp.getResult(slot.oldIndex).getType()) ||
+        slot.componentIndices.size() != slot.componentTypes.size())
+      return failure();
+    pointerInfos.push_back(IfPointerInfo{slot.oldIndex, slot.componentIndices,
+                                         slot.componentTypes, std::nullopt});
   }
 
-  if (pointerInfos.empty())
-    return failure();
-
+  // Expand only result positions selected by analysis. An if with no pointer
+  // result may still be rebuilt because one of its nested operations changes.
   SmallVector<Type> newResultTypes;
   for (auto [idx, result] : llvm::enumerate(ifOp.getResults())) {
     if (const IfPointerInfo *info = findIfInfo(pointerInfos, idx)) {
-      for (Value component :
-           getComponentValues(info->thenInfo, info->componentIndices))
-        newResultTypes.push_back(component.getType());
+      newResultTypes.append(info->componentTypes.begin(),
+                            info->componentTypes.end());
       continue;
     }
     newResultTypes.push_back(result.getType());
   }
 
   bool bodyOk = true;
-  auto buildBranch = [&](OpBuilder &branchBuilder, Location loc,
+  auto buildBranch = [&](OpBuilder &branchBuilder,
                          bool isThen) -> LogicalResult {
     // Each branch gets an isolated environment because values defined in one
     // branch must never be visible while cloning the other branch.
@@ -739,21 +752,18 @@ static LogicalResult rewriteIfOp(scf::IfOp ifOp, OpBuilder &builder,
 
     SmallVector<Value> newYieldOperands;
     for (auto [idx, oldOperand] : llvm::enumerate(oldYield.getOperands())) {
-      if (const IfPointerInfo *info = findIfInfo(pointerInfos, idx)) {
-        FailureOr<DecomposedValue> branchInfo = decompose(
-            oldOperand, branchEnv, branchBuilder, oldYield.getLoc());
-        if (failed(branchInfo))
+      if (IfPointerInfo *info = findIfInfo(pointerInfos, idx)) {
+        FailureOr<DecomposedValue> branchInfo =
+            decompose(oldOperand, branchEnv, branchBuilder, oldYield.getLoc());
+        if (failed(branchInfo) ||
+            failed(castPlannedComponents(*branchInfo, info->componentIndices,
+                                         info->componentTypes, branchBuilder,
+                                         oldYield.getLoc())))
           return failure();
+        if (isThen)
+          info->thenInfo = *branchInfo;
         SmallVector<Value> values =
             getComponentValues(*branchInfo, info->componentIndices);
-        SmallVector<Value> plannedValues =
-            getComponentValues(info->thenInfo, info->componentIndices);
-        if (values.size() != plannedValues.size() ||
-            !llvm::all_of(llvm::zip(values, plannedValues), [](auto pair) {
-              return std::get<0>(pair).getType() ==
-                     std::get<1>(pair).getType();
-            }))
-          return failure();
         newYieldOperands.append(values.begin(), values.end());
         continue;
       }
@@ -763,11 +773,15 @@ static LogicalResult rewriteIfOp(scf::IfOp ifOp, OpBuilder &builder,
     return success();
   };
 
+  // Create the shell first, then clone each old branch into the corresponding
+  // new region with independent mappings.
   auto newIfOp =
       builder.create<scf::IfOp>(ifOp.getLoc(), newResultTypes,
-                                remapValue(ifOp.getCondition(), env), true);
+                                remapValue(ifOp.getCondition(), env), hasElse);
   newIfOp->setAttrs(ifOp->getAttrs());
 
+  // The then region always exists, including for a result-less one-arm if.
+  // Rewriting it is still required when it contains affected nested SCF.
   {
     OpBuilder::InsertionGuard guard(builder);
     if (newResultTypes.empty()) {
@@ -776,10 +790,12 @@ static LogicalResult rewriteIfOp(scf::IfOp ifOp, OpBuilder &builder,
     } else {
       builder.setInsertionPointToStart(newIfOp.thenBlock());
     }
-    if (failed(buildBranch(builder, ifOp.getLoc(), /*isThen=*/true)))
+    if (failed(buildBranch(builder, /*isThen=*/true)))
       bodyOk = false;
   }
-  {
+  // An else region exists only for the two-arm form. In particular, do not
+  // access elseBlock() merely because the then region contains nested work.
+  if (hasElse) {
     OpBuilder::InsertionGuard guard(builder);
     if (newResultTypes.empty()) {
       newIfOp.elseBlock()->getTerminator()->erase();
@@ -787,7 +803,7 @@ static LogicalResult rewriteIfOp(scf::IfOp ifOp, OpBuilder &builder,
     } else {
       builder.setInsertionPointToStart(newIfOp.elseBlock());
     }
-    if (failed(buildBranch(builder, ifOp.getLoc(), /*isThen=*/false)))
+    if (failed(buildBranch(builder, /*isThen=*/false)))
       bodyOk = false;
   }
 
@@ -807,7 +823,7 @@ static LogicalResult rewriteIfOp(scf::IfOp ifOp, OpBuilder &builder,
       for (unsigned i = 0; i < info->componentIndices.size(); ++i)
         componentValues.push_back(newIfOp.getResult(newResultIndex++));
       FailureOr<DecomposedValue> resultInfo = withComponentValues(
-          info->thenInfo, info->componentIndices, componentValues);
+          *info->thenInfo, info->componentIndices, componentValues);
       if (failed(resultInfo)) {
         newIfOp.erase();
         return failure();
@@ -843,31 +859,41 @@ static LogicalResult rewriteControlFlowOp(Operation *op, OpBuilder &builder,
   return failure();
 }
 
-static SmallVector<Value> collectReplacements(Operation *op,
-                                              const RewriteEnv &env) {
+static FailureOr<SmallVector<Value>>
+collectReplacements(Operation *op, const RewriteEnv &env) {
   SmallVector<Value> replacements;
   replacements.reserve(op->getNumResults());
-  for (Value result : op->getResults())
-    replacements.push_back(remapValue(result, env));
+  for (Value result : op->getResults()) {
+    // Unlike remapValue(), replacement collection must not fall back to the
+    // original result. Such a fallback would hide an unhandled result slot and
+    // ask replaceOp to replace a value with itself.
+    Value replacement = env.valueMapping.lookupOrNull(result);
+    if (!replacement)
+      return failure();
+    replacements.push_back(replacement);
+  }
   return replacements;
 }
 
 static LogicalResult
 tryDecoupleControlFlowOp(Operation *op, IRRewriter &rewriter,
-                         const ControlFlowRewritePolicy &policy) {
-  // Build a replacement beside the original operation. The original remains
-  // untouched until every result has a valid mapped value, after which the
-  // standard rewriter performs the single externally visible replacement.
-  RewriteEnv env(policy);
+                         const ControlFlowRewritePolicy &policy,
+                         const ControlFlowRewritePlan &plan) {
+  // Build a replacement beside the original operation. The original operation
+  // itself remains until every result has a valid mapped value, after which the
+  // standard rewriter performs the externally visible replacement.
+  // TODO: Track and erase policy materializations created outside the new SCF
+  // operation if an unexpected rewrite-time validation fails. Read-only
+  // analysis makes that path exceptional, but failure should still be atomic.
+  RewriteEnv env(policy, plan);
   rewriter.setInsertionPoint(op);
   if (failed(rewriteControlFlowOp(op, rewriter, env)))
     return failure();
 
-  SmallVector<Value> replacements = collectReplacements(op, env);
-  if (replacements.size() != op->getNumResults() ||
-      llvm::any_of(replacements, [](Value value) { return !value; }))
+  FailureOr<SmallVector<Value>> replacements = collectReplacements(op, env);
+  if (failed(replacements))
     return failure();
-  rewriter.replaceOp(op, replacements);
+  rewriter.replaceOp(op, *replacements);
   return success();
 }
 
@@ -875,35 +901,36 @@ tryDecoupleControlFlowOp(Operation *op, IRRewriter &rewriter,
 
 namespace mlir::triton::controlflow {
 
-static void rewriteRegion(Region &region, IRRewriter &rewriter,
-                          const ControlFlowRewritePolicy &policy) {
-  // Visit outer operations first. A successful rewrite clones and recursively
-  // rewrites its nested regions, so descending again would process them twice.
-  // If the outer operation has no slot owned by this policy, descend normally
-  // to give nested control flow an independent chance to match.
-  for (Block &block : region) {
-    for (Operation &op : llvm::make_early_inc_range(block)) {
-      if (isa<scf::ForOp, scf::WhileOp, scf::IfOp>(op) &&
-          succeeded(tryDecoupleControlFlowOp(&op, rewriter, policy)))
-        continue;
-
-      for (Region &nested : op.getRegions())
-        rewriteRegion(nested, rewriter, policy);
+LogicalResult
+applyControlFlowRewritePlan(ModuleOp module,
+                            const ControlFlowRewritePolicy &policy,
+                            const ControlFlowRewritePlan &plan) {
+  IRRewriter rewriter(module.getContext());
+  // Analysis and application are consecutive and no IR mutation occurs in
+  // between, so rediscover the roots from the module instead of duplicating
+  // traversal state in the immutable operation plan.
+  for (Operation *root : collectOutermostControlFlowOps(module)) {
+    const ControlFlowOpAnalysis *rootAnalysis = plan.lookup(root);
+    if (!rootAnalysis) {
+      root->emitError("missing frozen control-flow rewrite decision");
+      return failure();
+    }
+    if (!rootAnalysis->needsRewrite())
+      continue;
+    if (failed(tryDecoupleControlFlowOp(root, rewriter, policy, plan))) {
+      root->emitError("failed to apply analyzed pointer decomposition");
+      return failure();
     }
   }
+  return success();
 }
 
 LogicalResult rewriteControlFlow(ModuleOp module,
                                  const ControlFlowRewritePolicy &policy) {
-  // The environment is deliberately recreated per top-level candidate. No
-  // address-readiness marker or analysis state escapes into the IR or the next
-  // decomposition invocation.
-  IRRewriter rewriter(module.getContext());
-  for (Region &region : module->getRegions())
-    rewriteRegion(region, rewriter, policy);
-  // TODO: Once policy analysis reports typed failures, propagate unsupported
-  // target slots and materialization-cleanup failures through this result.
-  return success();
+  FailureOr<ControlFlowRewritePlan> plan = analyzeControlFlow(module, policy);
+  if (failed(plan))
+    return failure();
+  return applyControlFlowRewritePlan(module, policy, *plan);
 }
 
 } // namespace mlir::triton::controlflow

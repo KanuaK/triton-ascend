@@ -157,6 +157,9 @@ static void moveBlockBodyBefore(Block *block, OpBuilder &builder) {
 }
 
 struct ReturnPathResult {
+  // A terminal path cannot place a return inside an scf.if region. Bubble the
+  // return operands outward so the caller can yield them and emit one return
+  // after the structured conditional.
   SmallVector<Value> operands;
 };
 
@@ -269,6 +272,8 @@ static bool haveSameTypes(ArrayRef<Type> lhs, ArrayRef<Type> rhs) {
 static Operation *createReturnLike(OpBuilder &builder, Location loc,
                                    Operation *sampleReturn,
                                    ValueRange operands) {
+  // Preserve whether the containing callable uses tt.return or func.return,
+  // along with any dialect-specific attributes on that terminator.
   OperationState state(loc, sampleReturn->getName());
   state.addOperands(operands);
   state.addAttributes(sampleReturn->getAttrs());
@@ -336,6 +341,8 @@ collectReturnPathTypes(Block *block, SmallPtrSetImpl<Block *> &visiting) {
 
 static Operation *findReturnOnPath(Block *block,
                                    SmallPtrSetImpl<Block *> &visited) {
+  // The operation name/attributes of one reachable return are used as the
+  // template after terminal paths have been converted to yielded values.
   if (!visited.insert(block).second)
     return nullptr;
 
@@ -352,6 +359,8 @@ static Operation *findReturnOnPath(Block *block,
 }
 
 static SmallVector<Value> mapValues(ValueRange values, IRMapping &mapping) {
+  // lookupOrDefault is intentional for values captured from outside the cloned
+  // path; only block arguments and locally cloned results require mappings.
   SmallVector<Value> mapped;
   mapped.reserve(values.size());
   for (Value value : values)
@@ -477,6 +486,8 @@ buildClonedTerminalPath(Block *block, ValueRange incoming, OpBuilder &builder,
 }
 
 static bool hasNonTreeCondBranch(Region &body) {
+  // A branch without a join cannot be consumed by the move-based path. If any
+  // such branch exists, clone the complete terminal tree atomically instead.
   for (Block &block : body) {
     auto condBr = dyn_cast<cf::CondBranchOp>(block.getTerminator());
     if (!condBr)
@@ -763,6 +774,8 @@ static LogicalResult appendStructuredBlock(Block *block, ValueRange incoming,
 }
 
 static LogicalResult validateSupportedCfg(Region &body) {
+  // Validate every reachable block before move-based construction starts, so
+  // unsupported terminators cannot leave a partially consumed function body.
   for (Block &block : body) {
     Operation *term = block.getTerminator();
     if (!isa<cf::BranchOp, cf::CondBranchOp>(term) && !isSupportedReturn(term))
@@ -884,7 +897,6 @@ static LogicalResult structureFunctionBody(Operation *funcOp, Region &body) {
   return success();
 }
 
-
 } // namespace
 
 namespace mlir::triton::controlflow {
@@ -898,6 +910,8 @@ LogicalResult structureCFG(ModuleOp module) {
       functions.push_back(op);
   });
 
+  // Handle both Triton callables and ordinary func.func wrappers; declarations
+  // and functions erased by an enclosing transformation are skipped.
   for (Operation *op : functions) {
     if (!op->getParentOp())
       continue;
