@@ -894,19 +894,21 @@ AtomicRMWConverter::matchAndRewrite(triton::AtomicRMWOp op, OpAdaptor adaptor,
        elementType.isInteger(32));
 
   bool isDiscreteMask = false;
+  bool hasContinuousMaskSubview = false;
+  MaskState mstate;
   if (mask) {
     auto constantMask = mask.getDefiningOp<arith::ConstantOp>();
     if (constantMask && !isConstantMaskTrue(mask)) {
       rewriter.eraseOp(op);
       return success();
     }
-    MaskState mstate;
     isDiscreteMask = mstate.parse(mask, loc, rewriter).failed();
     if (!constantMask && !isDiscreteMask) {
       // For dstMemref (store output), use subview to maintain reference to
       // original memref. For inputVal (store input), use tensor.extract_slice
       // to keep tensor semantics.
       dstMemref = mstate.getSubview(ptr, loc, rewriter);
+      hasContinuousMaskSubview = true;
       if (isHardwareSupported) {
         auto inputTensorType = RankedTensorType::get(
             inputMemrefType.getShape(), inputMemrefType.getElementType());
@@ -925,7 +927,15 @@ AtomicRMWConverter::matchAndRewrite(triton::AtomicRMWOp op, OpAdaptor adaptor,
         RankedTensorType::get(ptrType.getShape(), ptrType.getElementType());
     auto alloc = rewriter.create<memref::AllocOp>(
         loc, MemRefType::get(ptrType.getShape(), ptrType.getElementType()));
-    rewriter.create<memref::CopyOp>(loc, ptr, alloc);
+    Value copySrc = ptr;
+    Value copyDst = alloc;
+    if (hasContinuousMaskSubview) {
+      // Masked-off atomic results are undefined. Copy only the active region
+      // so the old-value read and the atomic store use the same address view.
+      copySrc = dstMemref;
+      copyDst = mstate.getSubview(alloc, loc, rewriter);
+    }
+    rewriter.create<memref::CopyOp>(loc, copySrc, copyDst);
     Value tensorToReplace = rewriter.create<bufferization::ToTensorOp>(
         loc, tensorType, alloc, true /* restrict */, true /* writable */);
     rewriter.replaceOp(op, tensorToReplace);
