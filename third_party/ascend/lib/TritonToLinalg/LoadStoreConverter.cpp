@@ -76,6 +76,7 @@ using namespace triton;
 
 const std::string MayImplicitTransposeWithLastAxisTAG =
     "MayImplicitTransposeWithLastAxis";
+static constexpr llvm::StringLiteral kAlreadySyncAttr = "already_sync";
 
 // During dialect conversion the adaptor may expose the converted memref
 // directly, while a failed rewrite later leaves a one-input, one-output UCC in
@@ -895,6 +896,7 @@ AtomicRMWConverter::matchAndRewrite(triton::AtomicRMWOp op, OpAdaptor adaptor,
 
   bool isDiscreteMask = false;
   bool hasContinuousMaskSubview = false;
+  bool hasUsedReturn = !op.getResult().use_empty();
   MaskState mstate;
   if (mask) {
     auto constantMask = mask.getDefiningOp<arith::ConstantOp>();
@@ -922,7 +924,10 @@ AtomicRMWConverter::matchAndRewrite(triton::AtomicRMWOp op, OpAdaptor adaptor,
     }
   }
 
-  if (!op.getResult().use_empty()) {
+  bool needsReturnValueLock =
+      hasUsedReturn && hasContinuousMaskSubview && isHardwareSupported;
+  Value returnValueLock;
+  if (hasUsedReturn) {
     auto tensorType =
         RankedTensorType::get(ptrType.getShape(), ptrType.getElementType());
     auto alloc = rewriter.create<memref::AllocOp>(
@@ -934,6 +939,13 @@ AtomicRMWConverter::matchAndRewrite(triton::AtomicRMWOp op, OpAdaptor adaptor,
       // so the old-value read and the atomic store use the same address view.
       copySrc = dstMemref;
       copyDst = mstate.getSubview(alloc, loc, rewriter);
+    }
+    if (needsReturnValueLock) {
+      auto lockType = MemRefType::get({1}, rewriter.getI64Type());
+      auto lockVar =
+          rewriter.create<hivm::CreateSyncBlockLockOp>(loc, lockType, Value());
+      returnValueLock = lockVar.getResult();
+      rewriter.create<hivm::SyncBlockLockOp>(loc, returnValueLock);
     }
     rewriter.create<memref::CopyOp>(loc, copySrc, copyDst);
     Value tensorToReplace = rewriter.create<bufferization::ToTensorOp>(
@@ -957,10 +969,16 @@ AtomicRMWConverter::matchAndRewrite(triton::AtomicRMWOp op, OpAdaptor adaptor,
     rewriter.create<hfusion::AtomicXchgOp>(op.getLoc(), TypeRange(),
                                            inputMemref, dstMemref, memrefMask);
   } else {
-    if (isHardwareSupported)
-      rewriter.create<hivm::StoreOp>(op.getLoc(), TypeRange{}, inputVal,
-                                     dstMemref, atomicKind);
-    else if (rmwOp == RMWOp::XCHG)
+    if (isHardwareSupported) {
+      auto storeOp = rewriter.create<hivm::StoreOp>(
+          op.getLoc(), TypeRange{}, inputVal, dstMemref, atomicKind);
+      if (needsReturnValueLock) {
+        // The return-value copy and the atomic update must be one critical
+        // section. Mark the store so HIVM does not add another lock.
+        storeOp->setAttr(kAlreadySyncAttr, rewriter.getUnitAttr());
+        rewriter.create<hivm::SyncBlockUnlockOp>(loc, returnValueLock);
+      }
+    } else if (rmwOp == RMWOp::XCHG)
       rewriter.create<hfusion::AtomicXchgOp>(op.getLoc(), TypeRange(),
                                              inputMemref, dstMemref);
     else {
