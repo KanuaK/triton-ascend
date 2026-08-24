@@ -92,12 +92,20 @@ _DEPRECATED_NPU_OPTIONS = frozenset({
 _RESERVED_NPU_OPTION_NAMES = _DEPRECATED_NPU_OPTIONS
 _WARNED_DEPRECATED_NPU_OPTIONS = set()
 
-# Boolean compatibility switches route only their enabled state.  False keeps
-# the canonical compile_mode supplied by the user or its backend default.
+# Boolean compatibility switches route only their enabled state.  An enabled
+# legacy force switch overrides compile_mode to preserve its historical force
+# semantics; False keeps the canonical mode or backend default unchanged.
 _DEPRECATED_NPU_OPTION_ROUTES = {
     "force_simt_only": ("compile_mode", "simt_only"),
     "force_simt_template": ("compile_mode", "simd_simt_template"),
 }
+
+# Apply weaker selectors first so pure SIMT wins if both legacy force switches
+# are enabled together.
+_DEPRECATED_NPU_OPTION_ROUTE_PRECEDENCE = (
+    "force_simt_template",
+    "force_simt_only",
+)
 
 # Renamed value options preserve the complete user value.  A simultaneously
 # supplied canonical option wins via setdefault below.
@@ -230,16 +238,19 @@ def _remove_deprecated_npu_options(options, *, in_place=False):
     """Normalize reserved legacy NPU options, copying by default."""
     normalized = options if in_place else dict(options)
     deprecated = _get_deprecated_npu_options(normalized)
+    active_routes = [
+        _DEPRECATED_NPU_OPTION_ROUTES[name]
+        for name in _DEPRECATED_NPU_OPTION_ROUTE_PRECEDENCE
+        if name in deprecated and normalized[name]
+    ]
     for name in sorted(deprecated):
         _warn_deprecated_npu_option(name)
-        route = _DEPRECATED_NPU_OPTION_ROUTES.get(name)
-        if route is not None and normalized[name]:
-            replacement_name, replacement_value = route
-            normalized.setdefault(replacement_name, replacement_value)
         alias = _DEPRECATED_NPU_OPTION_ALIASES.get(name)
         if alias is not None:
             normalized.setdefault(alias, normalized[name])
         normalized.pop(name)
+    for replacement_name, replacement_value in active_routes:
+        normalized[replacement_name] = replacement_value
     return normalized
 
 
