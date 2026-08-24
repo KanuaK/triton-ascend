@@ -60,6 +60,7 @@ from triton.backends.ascend.utils import (
     _get_auto_blockify_blacklist_reasons,
     _warn_auto_blockify_disabled,
     _remove_deprecated_npu_options,
+    _warn_deprecated_npu_option,
     _warn_deprecated_ascend_env_vars,
     downgrade_llir,
     force_disable_ffts,
@@ -1018,8 +1019,9 @@ class NPUOptions:
     warp_size: int = field(default=32, init=False)
     ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttadapter|mlirbc|bcmlir|npubin})
 
-    # Internal lowering selector derived from the explicit GPUTarget.arch.
-    compile_on_910_95: bool = field(init=False, repr=False)
+    # Deprecated constructor-only compatibility input.  The supplied value is
+    # ignored and replaced with the lowering selector derived from GPUTarget.arch.
+    compile_on_910_95: Optional[bool] = field(default=None, repr=False, kw_only=True)
     enable_warp_specialization: bool = False
     enable_persistent: bool = False
     optimize_epilogue: bool = False
@@ -1099,6 +1101,8 @@ class NPUOptions:
 
         _apply_ascend_patch()
         object.__setattr__(self, "target_arch", arch)
+        if self.compile_on_910_95 is not None:
+            _warn_deprecated_npu_option("compile_on_910_95")
         object.__setattr__(
             self,
             "compile_on_910_95",
@@ -1298,7 +1302,7 @@ class AscendBackend(BaseBackend):
             option_names = {
                 name
                 for name, option_field in NPUOptions.__dataclass_fields__.items()
-                if option_field.init and name != "arch"
+                if option_field.init and name not in {"arch", "compile_on_910_95"}
             }
             # Serialized NPUOptions include backend-only derived fields.  Use
             # those provenance markers instead of depending on every public
