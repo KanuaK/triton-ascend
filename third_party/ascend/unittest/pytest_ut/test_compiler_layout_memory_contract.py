@@ -699,3 +699,4 @@ def test_default_compile_mode_keeps_the_91095_layout_memory_gate_prepared(compil
 
     assert "force_simt_only" not in compiler_module.NPUOptions.__dataclass_fields__
     assert "force_simt_template" not in compiler_module.NPUOptions.__dataclass_fields__
+    assert "disable_auto_inject_block_sync" not in compiler_module.NPUOptions.__dataclass_fields__
