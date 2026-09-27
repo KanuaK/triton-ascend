@@ -29,6 +29,8 @@ if(TRITON_ENABLE_COVERAGE_HITEST)
       MLIRTritonNPUUtils           # from Utils
       TritonMemoryAccessCore
       TritonMemoryAccessAnalysis
+      TritonPointerAnalysis
+      TritonBlockPointerAnalysis
       TritonAscendIR               # from Dialect/TritonAscend/IR
       TritonStructuredIR           # from Dialect/TritonStructured/IR
       AutoBlockify
