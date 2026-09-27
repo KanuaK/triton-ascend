@@ -25,6 +25,7 @@
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 
+#include "TritonMemoryAccess/PointerAnalysis.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
@@ -32,6 +33,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -147,97 +149,93 @@ private:
   SmallVector<AxisInfo> structured;
 };
 
+/// One stable parsing phase. Local boundaries are prepared before public
+/// recursion; no analysis state survives source replacement or greedy rewrites.
+class OffsetAnalysisContext {
+public:
+  OffsetAnalysisContext(RewriterBase &rewriter,
+                        llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap,
+                        Operation *scope);
+  void resetPointerAnalysis();
+  unsigned getGeneration() const { return generation; }
+  bool requiresLocalAnalysis(Value value);
+  void parseOperands(ValueRange values);
+  bool parseCommonOffset(Value value);
+  bool parseCommonPointer(Value value);
+  bool bindLocalPointerBoundary(Value value);
+  void bindLocalOffsetBoundary(Value value);
+
+  RewriterBase &rewriter;
+  llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap;
+
+private:
+  unsigned generation = 0;
+  llvm::DenseMap<Value, bool> localPolicy;
+  llvm::DenseMap<Value, bool> laneLoweringPolicy;
+  bool requiresLaneLowering(Value value);
+  void prepareOffsetBoundaries(Value value);
+  llvm::DenseSet<Value> preparedOffsets;
+  pointer::PointerAnalysis analysis;
+  llvm::DenseSet<Value> pointerBoundaries;
+  llvm::DenseSet<Value> offsetBoundaries;
+  llvm::DenseSet<Value> publicPointers;
+  llvm::DenseSet<Value> publicOffsets;
+};
+
 PtrOffsetInfo combineInfo(const PtrOffsetInfo &lhs, const PtrOffsetInfo &rhs);
 
-void parse(Value operand, const Location &loc, RewriterBase &rewriter,
-           llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+void parse(Value operand, const Location &loc, OffsetAnalysisContext &context);
 
 void parseLoopRegionIterArg(LoopLikeOpInterface loopOp, const Location &loc,
-                            RewriterBase &rewriter,
-                            llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap,
+                            OffsetAnalysisContext &context,
                             BlockArgument regionIterArg);
 
 void parseArithOp(Operation *arithOp, const Location &loc,
-                  RewriterBase &rewriter,
-                  llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                  OffsetAnalysisContext &context);
 
 void parseTritonOp(Operation *tritonOp, const Location &loc,
-                   RewriterBase &rewriter,
-                   llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
-
-void parseTritonOp(Operation *tritonOp, const Location &loc,
-                   RewriterBase &rewriter,
-                   llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                   OffsetAnalysisContext &context);
 
 void parseAddPtr(triton::AddPtrOp op, const Location &loc,
-                 RewriterBase &rewriter,
-                 llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                 OffsetAnalysisContext &context);
 
-void parseSplat(triton::SplatOp op, const Location &loc, RewriterBase &rewriter,
-                llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+void parseSplat(triton::SplatOp op, const Location &loc,
+                OffsetAnalysisContext &context);
 
 template <typename BinOpTy>
-void parseBinaryOp(BinOpTy op, const Location &loc, RewriterBase &rewriter,
-                   llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
-
-void parseAddI(arith::AddIOp op, const Location &loc, RewriterBase &rewriter,
-               llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
-
-void parseSubI(arith::SubIOp op, const Location &loc, RewriterBase &rewriter,
-               llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
-
-void parseIndexCast(arith::IndexCastOp op, const Location &loc,
-                    RewriterBase &rewriter,
-                    llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+void parseBinaryOp(BinOpTy op, const Location &loc,
+                   OffsetAnalysisContext &context);
 
 template <typename ConstOpTy>
-void parseConstantOp(ConstOpTy dst, const Location &loc, RewriterBase &rewriter,
-                     llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
-
-void parseMakeRange(triton::MakeRangeOp op, const Location &loc,
-                    RewriterBase &rewriter,
-                    llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
-
-void parseExtSI(arith::ExtSIOp op, const Location &loc, RewriterBase &rewriter,
-                llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+void parseConstantOp(ConstOpTy dst, const Location &loc,
+                     OffsetAnalysisContext &context);
 
 void parseBitcast(triton::BitcastOp op, const Location &loc,
-                  RewriterBase &rewriter,
-                  llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                  OffsetAnalysisContext &context);
 
-void parseLoad(triton::LoadOp op, const Location &loc, RewriterBase &rewriter,
-               llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
-
-void parseMulI(arith::MulIOp op, const Location &loc, RewriterBase &rewriter,
-               llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+void parseLoad(triton::LoadOp op, const Location &loc,
+               OffsetAnalysisContext &context);
 
 void parseBroadcast(triton::BroadcastOp op, const Location &loc,
-                    RewriterBase &rewriter,
-                    llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                    OffsetAnalysisContext &context);
 
 void parseExpandDims(triton::ExpandDimsOp op, const Location &loc,
-                     RewriterBase &rewriter,
-                     llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                     OffsetAnalysisContext &context);
 
 void parseReshape(triton::ReshapeOp op, const Location &loc,
-                  RewriterBase &rewriter,
-                  llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                  OffsetAnalysisContext &context);
 
 void parseClampF(triton::ClampFOp op, const Location &loc,
-                 RewriterBase &rewriter,
-                 llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                 OffsetAnalysisContext &context);
 
 void parseSelect(arith::SelectOp op, const Location &loc,
-                 RewriterBase &rewriter,
-                 llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                 OffsetAnalysisContext &context);
 
 void parseFPToSI(arith::FPToSIOp op, const Location &loc,
-                 RewriterBase &rewriter,
-                 llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                 OffsetAnalysisContext &context);
 
 void parseSIToFP(arith::SIToFPOp op, const Location &loc,
-                 RewriterBase &rewriter,
-                 llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                 OffsetAnalysisContext &context);
 
 // FIXME:Z|wait triton version upgrade to 3.4
 // void parseMakeTensorDesc(triton::MakeTensorDescOp op, const Location &loc,
@@ -245,54 +243,43 @@ void parseSIToFP(arith::SIToFPOp op, const Location &loc,
 //                          llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
 
 void parseMakeTensorPtr(triton::MakeTensorPtrOp op, const Location &loc,
-                        RewriterBase &rewriter,
-                        llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                        OffsetAnalysisContext &context);
 
 void parseAdvance(triton::AdvanceOp op, const Location &loc,
-                  RewriterBase &rewriter,
-                  llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                  OffsetAnalysisContext &context);
 
 void parseReduce(triton::ReduceOp op, const Location &loc,
-                 RewriterBase &rewriter,
-                 llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                 OffsetAnalysisContext &context);
 
 void parseReduceReturn(triton::ReduceReturnOp op, const Location &loc,
-                       RewriterBase &rewriter,
-                       llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                       OffsetAnalysisContext &context);
 
-void parseIf(scf::IfOp op, const Location &loc, RewriterBase &rewriter,
-             llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap, Value dst);
+void parseIf(scf::IfOp op, const Location &loc, OffsetAnalysisContext &context,
+             Value dst);
 
-void parseYield(scf::YieldOp op, const Location &loc, RewriterBase &rewriter,
-                llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+void parseYield(scf::YieldOp op, const Location &loc,
+                OffsetAnalysisContext &context);
 
 void parseLoopOp(LoopLikeOpInterface op, const Location &loc,
-                 RewriterBase &rewriter,
-                 llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap, Value dst);
+                 OffsetAnalysisContext &context, Value dst);
 
 void parseExtractSlice(tensor::ExtractSliceOp op, const Location &loc,
-                       RewriterBase &rewriter,
-                       llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                       OffsetAnalysisContext &context);
 
 void parseInsertSlice(tensor::InsertSliceOp op, const Location &loc,
-                      RewriterBase &rewriter,
-                      llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                      OffsetAnalysisContext &context);
 
 void parseExtract(tensor::ExtractOp op, const Location &loc,
-                  RewriterBase &rewriter,
-                  llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                  OffsetAnalysisContext &context);
 
 void parseInsert(tensor::InsertOp op, const Location &loc,
-                 RewriterBase &rewriter,
-                 llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                 OffsetAnalysisContext &context);
 
 void parseIntToPtr(triton::IntToPtrOp op, const Location &loc,
-                   RewriterBase &rewriter,
-                   llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap);
+                   OffsetAnalysisContext &context);
 
 void parseStructuredCustomOp(Operation *op, const Location &loc,
-                             RewriterBase &rewriter,
-                             llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap,
+                             OffsetAnalysisContext &context,
                              unsigned resultIdx);
 } // namespace triton
 
