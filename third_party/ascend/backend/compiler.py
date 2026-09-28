@@ -858,9 +858,6 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 _compile_option_list += ["--enable-hivm-batch-matmul"]
             if metadata.get("enable_vf_stack_limit"):
                 _compile_option_list += ["--enable-vf-stack-limit"]
-        bisheng_options = metadata["bisheng_options"]
-        if bisheng_options is not None:
-            _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
         _compile_option_list += ["--mlir-print-ir-after-failure"]
         _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
 
@@ -1203,7 +1200,6 @@ class NPUOptions:
     allowed_dot_input_precisions: Tuple[str] = ("ieee", "hf32")
     max_num_imprecise_acc_default: int = 0
     extern_libs: dict = None
-    bisheng_options: str = "-cce-link-aicore-ll-module " + get_libdevice()
     multibuffer: bool = True
     vf_fusion_mode: str = None
     enable_ubuf_saving: bool = None
@@ -1277,6 +1273,7 @@ class NPUOptions:
     allow_fp8e4nv: bool = field(default=False, init=False)
     auto_blockify_size: int = field(default=1, init=False)
     auto_tile_and_bind_subblock: bool = field(default=True, init=False)
+    bisheng_options: Optional[str] = field(default=None, init=False)
     code_motion: Optional[bool] = field(default=None, init=False)
     enable_auto_blockify: Optional[bool] = field(default=None, init=False)
     enable_bishengir_simt_optimization: int = field(default=0, init=False)
@@ -1443,10 +1440,6 @@ def ttir_to_npubin(mod, metadata, opt):
                         f"--custom-aic-number={npu_utils.get_aicore_num()}",
                         f"--custom-aiv-number={npu_utils.get_aivector_core_num()}",
                     ]
-
-            bisheng_options = metadata["bisheng_options"]
-            if bisheng_options is not None:
-                _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
 
             if _is_auto_map_parallel_blocks_enabled() and not metadata.get("row_coalescing_applied", False):
                 _compile_option_list += ["--enable-auto-blockify-loop"]
