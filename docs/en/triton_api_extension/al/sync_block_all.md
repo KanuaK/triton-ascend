@@ -1,5 +1,7 @@
 # 1. Hardware Background
 
+When using this affinity extension API, you must set `disable_auto_inject_block_sync=True` in `triton.Config` or the kernel launch meta-parameters to disable automatic insertion of inter-core synchronization by the compiler and manage inter-core synchronization explicitly. See the [compiler option reference](../../environment_variable_and_compiler_options_reference.md).
+
 When different cores operate on the same block of global memory and there may be data dependencies such as read-after-write, write-after-read, or write-after-write, this function can be used to insert synchronization statements to avoid incorrect reads and writes caused by those dependencies.
 
 # 2. Interface Description

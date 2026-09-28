@@ -108,6 +108,7 @@ The following table describes the options.
 | **Synchronization** | `unit_flag` | `None`, `True`, `False` | Cube-output synchronization option. | `triton.Config` or autotune parameter |
 | **Synchronization** | `inject_barrier_all` | `None`, `True`, `False` | Enables or disables automatic barrier synchronization injection. | `triton.Config` or launch meta-parameter |
 | **Synchronization** | `inject_block_all` | `None`, `True`, `False` | Enables or disables automatic block synchronization injection. | `triton.Config` or launch meta-parameter |
+| **Synchronization** | `disable_auto_inject_block_sync` | `None` (default), `True`, `False` | Set to `True` to disable automatic insertion of inter-core synchronization by the compiler. `False` leaves it enabled; `None` does not explicitly pass this control to the compiler. When using the affinity extension APIs `sync_block_all`, `sync_block_set`, or `sync_block_wait`, you must set `disable_auto_inject_block_sync=True` and manage inter-core synchronization explicitly through these APIs. | `triton.Config` or launch meta-parameter |
 | **Multibuffer scope** | `limit_auto_multi_buffer_only_for_local_buffer` | `None`, `True`, `False` | Restricts automatic multi-buffering to local buffers. | `triton.Config` or autotune parameter |
 | **Multibuffer scope** | `limit_auto_multi_buffer_of_local_buffer` | `None`, `"no-limit"`, `"no-l0c"` | Configures the local-buffer automatic multi-buffering scope. | `triton.Config` or autotune parameter |
 | **Workspace** | `set_workspace_multibuffer` | `None`, `2`, `4` | Configures workspace multi-buffering. | `triton.Config` or autotune parameter |
@@ -151,7 +152,6 @@ The following deprecated options no longer have an effective public control with
 | `auto_tile_and_bind_subblock` | Remove it; tiling and sub-block binding are derived from Linalg IR and lock semantics. |
 | `code_motion` | Remove it; the former vendor compiler control has been removed and has no replacement. |
 | `compile_on_910_95` | Remove it; the target product is detected from the compilation target. |
-| `disable_auto_inject_block_sync` | Remove it; block synchronization injection is managed by NPU IR. |
 | `disable_size_align_for_cast` | Remove it; the former vendor compiler control has been removed and has no replacement. |
 | `enable_auto_blockify` | Remove it; automatic block mapping and its safety analysis are backend-managed. |
 | `enable_buffer_insert_optimization` | Remove it; DynamicCV keeps buffer insertion optimization enabled internally. |

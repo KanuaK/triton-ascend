@@ -1,5 +1,7 @@
 # al.sync_block_set API Documentation
 
+When using this affinity extension API, you must set `disable_auto_inject_block_sync=True` in `triton.Config` or the kernel launch meta-parameters to disable automatic insertion of inter-core synchronization by the compiler and manage inter-core synchronization explicitly. See the [compiler option reference](../../environment_variable_and_compiler_options_reference.md).
+
 ## 1. Hardware Background
 
 An inter-core synchronization control interface for split-mode execution.

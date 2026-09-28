@@ -108,6 +108,7 @@ if __name__ == "__main__":
 | **同步** | `unit_flag` | `None`、`True`、`False` | Cube 搬出相关同步优化项。 | `triton.Config` 或 Autotune 参数 |
 | **同步** | `inject_barrier_all` | `None`、`True`、`False` | 启用或禁用自动注入 barrier 同步。 | `triton.Config` 或 launch meta-parameter |
 | **同步** | `inject_block_all` | `None`、`True`、`False` | 启用或禁用自动注入 block 同步。 | `triton.Config` 或 launch meta-parameter |
+| **同步** | `disable_auto_inject_block_sync` | `None`（默认）、`True`、`False` | 设为 `True` 时禁用编译器自动插入核间同步；`False` 表示不禁用，`None` 表示不显式传入该控制参数。使用扩展亲和接口 `sync_block_all`、`sync_block_set` 或 `sync_block_wait` 时，必须设置 `disable_auto_inject_block_sync=True`，由用户通过这些接口显式管理核间同步。 | `triton.Config` 或 launch meta-parameter |
 | **多缓冲范围** | `limit_auto_multi_buffer_only_for_local_buffer` | `None`、`True`、`False` | 限制自动 multi-buffer 只作用于 local buffer。 | `triton.Config` 或 Autotune 参数 |
 | **多缓冲范围** | `limit_auto_multi_buffer_of_local_buffer` | `None`、`"no-limit"`、`"no-l0c"` | 配置 local buffer 自动 multi-buffer 的 scope。 | `triton.Config` 或 Autotune 参数 |
 | **Workspace** | `set_workspace_multibuffer` | `None`、`2`、`4` | 配置 workspace multi-buffer 档位。 | `triton.Config` 或 Autotune 参数 |
@@ -151,7 +152,6 @@ if __name__ == "__main__":
 | `auto_tile_and_bind_subblock` | 删除该选项；tiling 和 sub-block binding 由 Linalg IR 与 lock 语义推导。 |
 | `code_motion` | 删除该选项；原 vendor compiler 控制项已移除，无替代项。 |
 | `compile_on_910_95` | 删除该选项；目标产品由编译目标自动识别。 |
-| `disable_auto_inject_block_sync` | 删除该选项；block synchronization injection 由 NPU IR 管理。 |
 | `disable_size_align_for_cast` | 删除该选项；原 vendor compiler 控制项已移除，无替代项。 |
 | `enable_auto_blockify` | 删除该选项；自动 block mapping 及安全分析由后端管理。 |
 | `enable_buffer_insert_optimization` | 删除该选项；DynamicCV 在内部保持 buffer insertion optimization 开启。 |

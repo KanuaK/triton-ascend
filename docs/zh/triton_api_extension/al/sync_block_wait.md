@@ -1,5 +1,7 @@
 # al.sync_block_wait 接口文档
 
+使用该扩展亲和接口时，必须在 `triton.Config` 或 kernel launch meta-parameter 中设置 `disable_auto_inject_block_sync=True`，禁用编译器自动插入核间同步，由用户显式管理核间同步。参见[编译选项说明](../../environment_variable_and_compiler_options_reference.md)。
+
 ## 1. 硬件背景
 
 面向分离模式的核间同步控制接口。

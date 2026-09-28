@@ -1,5 +1,7 @@
 # 1. 硬件背景
 
+使用该扩展亲和接口时，必须在 `triton.Config` 或 kernel launch meta-parameter 中设置 `disable_auto_inject_block_sync=True`，禁用编译器自动插入核间同步，由用户显式管理核间同步。参见[编译选项说明](../../environment_variable_and_compiler_options_reference.md)。
+
 当不同核之间操作同一块全局内存且可能存在读后写、写后读以及写后写等数据依赖问题时，通过调用该函数来插入同步语句来避免上述数据依赖时可能出现的数据读写错误问题。
 
 # 2. 接口说明
