@@ -97,7 +97,6 @@ if __name__ == "__main__":
 |------|----------|----------------|----------|----------|
 | **通用流水** | `multibuffer` | `True`（默认）、`False` | 启用或禁用 ping-pong/double buffer 流水。默认开启。 | `triton.Config` 或 launch meta-parameter |
 | **图优化** | `enable_graph_optimize` | `True`（默认）、`False` | 启用或禁用 TTIR Graph Optimization。具体规则、重写次数和 UB 预算由后端维护。 | `triton.Config` 或 launch meta-parameter |
-| **毕昇编译器** | `bisheng_options` | 后端默认字符串或用户字符串 | 向支持该选项的毕昇编译路径透传附加参数。 | `triton.Config` 或 launch meta-parameter |
 | **CV 融合** | `enable_auto_bind_sub_block` | `None`、`True`、`False` | 启用或禁用自动绑定 sub-block。 | `triton.Config` 或 launch meta-parameter |
 | **CV 融合** | `enable_hivm_auto_cv_balance` | `None`、`True`、`False` | 启用或禁用自动 CV balance。 | `triton.Config` 或 Autotune 参数 |
 | **CV 融合** | `enable_cube_block_merge` | `False`（默认）、`True` | 控制 DynamicCV pipeline 的 Cube block merge。 | `triton.Config` 或 launch meta-parameter |
@@ -149,6 +148,7 @@ if __name__ == "__main__":
 | `arch` | 删除该选项；目标架构由编译目标的 `GPUTarget.arch` 提供。 |
 | `auto_blockify_size` | 删除该选项；该字段没有有效 consumer，无替代项。 |
 | `auto_tile_and_bind_subblock` | 删除该选项；tiling 和 sub-block binding 由 Linalg IR 与 lock 语义推导。 |
+| `bisheng_options` | 删除；不再向 NPU 编译器透传任意 BiSheng 选项。 |
 | `code_motion` | 删除该选项；原 vendor compiler 控制项已移除，无替代项。 |
 | `compile_on_910_95` | 删除该选项；目标产品由编译目标自动识别。 |
 | `disable_auto_inject_block_sync` | 删除该选项；block synchronization injection 由 NPU IR 管理。 |

@@ -97,7 +97,6 @@ The following table describes the options.
 |----------|-----------------|----------------|----------------------|--------------------|
 | **General pipeline** | `multibuffer` | `True` (default), `False` | Enables or disables ping-pong/double-buffer pipelines. Enabled by default. | `triton.Config` or launch meta-parameter |
 | **Graph optimization** | `enable_graph_optimize` | `True` (default), `False` | Enables or disables TTIR Graph Optimization. The backend owns the individual rules, rewrite limit, and UB budget. | `triton.Config` or launch meta-parameter |
-| **BiSheng compiler** | `bisheng_options` | Backend default string or a user-provided string | Forwards additional arguments to BiSheng compilation paths that support this option. | `triton.Config` or launch meta-parameter |
 | **CV fusion** | `enable_auto_bind_sub_block` | `None`, `True`, `False` | Enables or disables automatic sub-block binding. | `triton.Config` or launch meta-parameter |
 | **CV fusion** | `enable_hivm_auto_cv_balance` | `None`, `True`, `False` | Enables or disables automatic CV balance. | `triton.Config` or autotune parameter |
 | **CV fusion** | `enable_cube_block_merge` | `False` (default), `True` | Controls Cube block merging in the DynamicCV pipeline. | `triton.Config` or launch meta-parameter |
@@ -149,6 +148,7 @@ The following deprecated options no longer have an effective public control with
 | `arch` | Remove it; the target architecture is provided by the compilation target's `GPUTarget.arch`. |
 | `auto_blockify_size` | Remove it; the field had no effective consumer and has no replacement. |
 | `auto_tile_and_bind_subblock` | Remove it; tiling and sub-block binding are derived from Linalg IR and lock semantics. |
+| `bisheng_options` | Remove it; arbitrary BiSheng options are no longer forwarded to the NPU compiler. |
 | `code_motion` | Remove it; the former vendor compiler control has been removed and has no replacement. |
 | `compile_on_910_95` | Remove it; the target product is detected from the compilation target. |
 | `disable_auto_inject_block_sync` | Remove it; block synchronization injection is managed by NPU IR. |
