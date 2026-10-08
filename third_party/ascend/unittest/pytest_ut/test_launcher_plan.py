@@ -40,8 +40,12 @@ from triton.backends.ascend import launcher, utils
 def cache_configuration_scope():
     from triton import knobs
     # Attribute overrides and environment changes both belong to this test.
-    with knobs.cache.scope():
-        yield
+    launcher._runtime_sources.cache_clear()
+    try:
+        with knobs.cache.scope():
+            yield
+    finally:
+        launcher._runtime_sources.cache_clear()
 
 
 def metadata(**changes):
@@ -239,8 +243,20 @@ def test_helper_optimization_flags_invalidate_cached_artifact(prepared_backend, 
 
 def test_repeated_preparation_reuses_keys_and_artifacts(prepared_backend, monkeypatch):
     state = prepared_backend
+    reads = []
+    read_text = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if path.parent == state.root / "launcher_src":
+            reads.append(path.name)
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
     first = state.driver.NPULauncher(state.src, metadata())
     assert len(state.builds) == 2
+    first_reads = list(reads)
+    assert len(first_reads) == len(set(first_reads)) == 7
+    assert "launcher_export.cpp" not in first_reads
     hashes = []
     original_hash = hashlib.sha256
     monkeypatch.setattr(hashlib, "sha256", lambda *a, **kw: (hashes.append(a), original_hash(*a, **kw))[1])
@@ -252,24 +268,92 @@ def test_repeated_preparation_reuses_keys_and_artifacts(prepared_backend, monkey
     assert first.launch.spec["workspace_size"] == 0
     assert len(state.builds) == 2
     assert hashes == []
+    assert reads == first_reads
 
 
-def test_prepared_sources_and_build_options_invalidate(prepared_backend):
+def test_prepared_sources_are_fixed_but_build_options_invalidate(prepared_backend):
     state = prepared_backend
     first = state.driver.NPULauncher(state.src, metadata())
     header = state.root / "launcher_src/launcher_args.h"
     header.write_text(header.read_text() + "\n// changed layout source\n")
     second = state.driver.NPULauncher(state.src, metadata())
-    assert second._runtime_path != first._runtime_path
-    assert len(state.builds) == 3
+    assert second._runtime_path == first._runtime_path
+    assert len(state.builds) == 2
     (state.root / "npu_utils.cpp").write_text("helper source v2")
     third = state.driver.NPULauncher(state.src, metadata())
     assert third._runtime_path != second._runtime_path
-    assert len(state.builds) == 5  # New helper identity also changes the dependency config.
+    assert len(state.builds) == 4  # New helper identity also changes the dependency config.
     state.fingerprint["compiler"] = "toolchain-b"
     fourth = state.driver.NPULauncher(state.src, metadata())
     assert fourth._runtime_path != third._runtime_path
-    assert len(state.builds) == 7
+    assert len(state.builds) == 6
+
+
+def _runtime_sources_process(root, results):
+    launcher.__file__ = str(Path(root) / "launcher.py")
+    # A spawn child imports the backend afresh; do not clear a prewarmed cache.
+    assert launcher._runtime_sources.cache_info().currsize == 0
+    sources = launcher._runtime_sources()
+    results.put((dict(sources), launcher._shared_key("{}", tuple(sorted(sources.items())))))
+
+
+def test_runtime_source_edits_take_effect_in_a_new_process(prepared_backend):
+    state = prepared_backend
+    sources = launcher._runtime_sources()
+    old_key = launcher._shared_key("{}", tuple(sorted(sources.items())))
+    header = state.root / "launcher_src/launcher_args.h"
+    original = header.read_text()
+    identity = header.stat()
+    # No source stat shortcut: a new process must read same-sized modified text.
+    updated = original.replace("Copyright", "copyright", 1)
+    assert updated != original and len(updated) == len(original)
+    header.write_text(updated)
+    os.utime(header, ns=(identity.st_atime_ns, identity.st_mtime_ns))
+    assert launcher._runtime_sources() is sources
+    assert sources["launcher_args.h"] == original
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    child = context.Process(target=_runtime_sources_process, args=(str(state.root), results))
+    try:
+        child.start()
+        fresh_sources, fresh_key = results.get(timeout=90)
+        child.join(timeout=90)
+        assert child.exitcode == 0
+    finally:
+        if child.is_alive():
+            child.terminate()
+        child.join(timeout=10)
+    assert fresh_sources["launcher_args.h"] == updated
+    assert fresh_key != old_key
+
+
+def test_runtime_source_snapshot_is_read_only(prepared_backend):
+    sources = launcher._runtime_sources()
+    with pytest.raises(TypeError):
+        sources["launcher_args.h"] = "corrupted source"
+
+
+def test_runtime_source_read_failure_can_retry(prepared_backend, monkeypatch):
+    state = prepared_backend
+    header = state.root / "launcher_src/launcher_args.h"
+    read_text = Path.read_text
+    attempts = []
+
+    def read(path, *args, **kwargs):
+        if path == header:
+            attempts.append(path)
+            if len(attempts) == 1:
+                raise OSError("temporary source read failure")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    with pytest.raises(OSError, match="temporary source read failure"):
+        state.driver.NPULauncher(state.src, metadata())
+    assert len(state.builds) == 1  # Only the helper was built before the failure.
+    first = state.driver.NPULauncher(state.src, metadata())
+    assert state.driver.NPULauncher(state.src, metadata())._runtime_path == first._runtime_path
+    assert len(state.builds) == 2
+    assert len(attempts) == 2
 
 
 @pytest.mark.parametrize("setting", ["TRITON_CACHE_DIR", "TRITON_HOME", "knob"])
@@ -391,7 +475,7 @@ def test_preparation_preserves_existing_content_keys(prepared_backend):
     source = (state.root / "npu_utils.cpp").read_text()
     expected = hashlib.sha256(json.dumps([source, state.fingerprint], sort_keys=True).encode()).hexdigest()
     assert state.driver.NPUUtils().get_so_path() == get_cache_manager(expected).get_file("npu_utils.so")
-    sources = launcher._runtime_sources(launcher._runtime_source_identity())
+    sources = launcher._runtime_sources()
     config = launcher._runtime_config(launcher._cache_relative(state.driver.NPUUtils().get_so_path()),
                                       utils.backend_policy, None)
     key = hashlib.sha256(json.dumps([state.fingerprint, {**sources, **config}], sort_keys=True).encode()).hexdigest()

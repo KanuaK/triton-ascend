@@ -29,6 +29,7 @@ from pathlib import Path
 import re
 import sysconfig
 import tempfile
+from types import MappingProxyType
 
 from triton.runtime.cache import get_cache_manager, get_dump_manager
 from . import utils
@@ -263,24 +264,26 @@ def wrap_handle_tensordesc(launcher, signature):
     return wrapped
 
 
-def _runtime_source_identity():
+@lru_cache(maxsize=1)
+def _runtime_sources():
+    """Read fixed runtime sources once per process; edits require a restart.
+
+    Cache contents rather than file attributes, without caching build settings
+    or artifact locations. Failed reads are not cached.
+    """
     root = Path(__file__).with_name("launcher_src")
-    # Content, rather than timestamps, also detects same-size edits within a
-    # filesystem clock tick. The prepared mapping and digest are still reused.
-    return tuple((name, (root / name).read_text()) for name in (
-        "launcher_runtime.cpp",
-        "launcher_abi.h",
-        "launcher_args.h",
-        "launcher_cann.h",
-        "launcher_backend.h",
-        "launcher_cache.h",
-        "launcher_profiler.h",
-    ))
-
-
-@lru_cache(maxsize=8)
-def _runtime_sources(identity):
-    return dict(identity)
+    return MappingProxyType({
+        name: (root / name).read_text()
+        for name in (
+            "launcher_runtime.cpp",
+            "launcher_abi.h",
+            "launcher_args.h",
+            "launcher_cann.h",
+            "launcher_backend.h",
+            "launcher_cache.h",
+            "launcher_profiler.h",
+        )
+    })
 
 
 def _cache_relative(path):
@@ -345,8 +348,7 @@ def get_runtime(npu_utils_path, debug=False):
         print_identity = (bisheng, utils._file_identity(bisheng), version_file,
                           utils._file_identity(version_file) if version_file else None)
     sources = {
-        **_runtime_sources(_runtime_source_identity()),
-        **_runtime_config(_cache_relative(npu_utils_path), utils.backend_policy, print_identity)
+        **_runtime_sources(), **_runtime_config(_cache_relative(npu_utils_path), utils.backend_policy, print_identity)
     }
     path = _build_shared("__triton_launcher_runtime", sources, debug)
     return _load_runtime(path), path
@@ -360,7 +362,7 @@ def export_launcher(spec, types, runtime_path, debug=False):
               f"static constexpr TritonNpuLaunchSpecV1 spec = {{1, sizeof(TritonNpuLaunchSpecV1), {fields}}};\n"
               f"static constexpr TritonNpuArgTypeV1 types[] = {{{initializers}}};\n"
               f"static constexpr size_t numTypes = {len(types)};\n")
-    native = _runtime_sources(_runtime_source_identity())
+    native = _runtime_sources()
     sources = {name: native[name] for name in ("launcher_abi.h", "launcher_cache.h")}
     export_source = str(Path(__file__).with_name("launcher_src") / "launcher_export.cpp")
     sources["launcher_export.cpp"] = Path(export_source).read_text()
