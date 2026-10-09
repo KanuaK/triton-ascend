@@ -770,4 +770,38 @@ TEST(PointerAnalysisLifecycle, BlockSessionRejectsUnsupportedAddressWidths) {
   checkAddressOptions<BlockPointerAnalysis>(context);
 }
 
+TEST(PointerAnalysisLifecycle, UnseenBindingsPreserveCompletedRequests) {
+  MLIRContext context;
+  context.loadDialect<arith::ArithDialect, triton::TritonDialect>();
+  auto module = parseSourceString<ModuleOp>(R"mlir(
+    module { tt.func @bindings(%x: i64, %unseen: i64) {
+      %sum = arith.addi %x, %x : i64
+      tt.return
+    } }
+  )mlir", &context);
+  ASSERT_TRUE(module);
+  auto f = *module->getOps<triton::FuncOp>().begin();
+  auto sum = *f.getBody().front().getOps<arith::AddIOp>().begin();
+  OpBuilder builder(&context);
+  PointerAnalysis analysis(builder);
+  ASSERT_TRUE(succeeded(analysis.analyzeOffset(sum)));
+  const auto *cached = analysis.findCachedOffset(sum);
+  ASSERT_NE(cached, nullptr);
+  auto unseen = makeOpaqueOffset(f.getArgument(1), builder);
+  ASSERT_TRUE(succeeded(unseen));
+  ASSERT_TRUE(succeeded(analysis.bindOffset(f.getArgument(1), *unseen)));
+  EXPECT_EQ(analysis.findCachedOffset(sum), cached);
+  // An observed leaf can already contribute to derived results even without an
+  // explicit old binding. Installing its first binding must invalidate them.
+  auto observed = makeOpaqueOffset(f.getArgument(0), builder);
+  ASSERT_TRUE(succeeded(observed));
+  ASSERT_TRUE(succeeded(analysis.bindOffset(f.getArgument(0), *observed)));
+  EXPECT_EQ(analysis.findCachedOffset(sum), nullptr);
+  ASSERT_TRUE(succeeded(analysis.analyzeOffset(sum)));
+  // Replacing an existing binding retains the conservative invalidation rule.
+  ASSERT_TRUE(succeeded(analysis.bindOffset(f.getArgument(1), *unseen)));
+  EXPECT_EQ(analysis.findCachedOffset(sum), nullptr);
+  EXPECT_TRUE(succeeded(verify(*module)));
+}
+
 } // namespace

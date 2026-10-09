@@ -21,6 +21,7 @@
  */
 
 #include "TritonToUnstructure/UnstructureConversionPass.h"
+#include "PointerAnalysisTestUtils.h"
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -243,7 +244,7 @@ module {
   EXPECT_TRUE(succeeded(verify(*module)));
 }
 
-TEST(OffsetAnalysisContext, LocalArithmeticRepreparesOperandsAfterReset) {
+TEST(OffsetAnalysisContext, LocalArithmeticUsesPreparedSourceWithoutReset) {
   MLIRContext mlirContext;
   mlirContext.loadDialect<arith::ArithDialect, triton::TritonDialect,
                           tensor::TensorDialect, scf::SCFDialect>();
@@ -275,9 +276,10 @@ module {
   ASSERT_TRUE(sum);
   llvm::DenseMap<Value, PtrOffsetInfo> cache;
   IRRewriter rewriter(&mlirContext);
+  normalizePointerAnalysisInputs(*module, rewriter);
   OffsetAnalysisContext analysis(rewriter, cache, *module);
   parse(sum.getResult(), sum.getLoc(), analysis);
-  EXPECT_GT(analysis.getGeneration(), 0u);
+  EXPECT_EQ(analysis.getGeneration(), 0u);
   ASSERT_TRUE(cache.contains(sum.getLhs()));
   ASSERT_TRUE(cache.contains(sum.getRhs()));
   EXPECT_TRUE(cache.at(sum.getLhs()).isStructured());
@@ -295,7 +297,7 @@ module {
   EXPECT_TRUE(succeeded(verify(*module)));
 }
 
-TEST(OffsetAnalysisContext, CustomSourceMappingSurvivesLaterOperandReset) {
+TEST(OffsetAnalysisContext, CustomSourceMappingUsesPreparedSourceWithoutReset) {
   MLIRContext mlirContext;
   mlirContext.loadDialect<arith::ArithDialect, triton::TritonDialect,
                           tensor::TensorDialect, hivm::HIVMDialect,
@@ -327,9 +329,10 @@ TEST(OffsetAnalysisContext, CustomSourceMappingSurvivesLaterOperandReset) {
   ASSERT_TRUE(custom);
   IRRewriter rewriter(&mlirContext);
   llvm::DenseMap<Value, PtrOffsetInfo> cache;
+  normalizePointerAnalysisInputs(*module, rewriter);
   OffsetAnalysisContext analysis(rewriter, cache, *module);
   parse(custom->getResult(0), custom.getLoc(), analysis);
-  EXPECT_GT(analysis.getGeneration(), 0u);
+  EXPECT_EQ(analysis.getGeneration(), 0u);
   ASSERT_TRUE(cache.contains(custom->getOperand(0)));
   const auto &result = cache.at(custom->getResult(0));
   EXPECT_EQ(result.getRank(), 1);
@@ -338,5 +341,111 @@ TEST(OffsetAnalysisContext, CustomSourceMappingSurvivesLaterOperandReset) {
   EXPECT_EQ(result.getPtr(),
             custom->getParentOfType<triton::FuncOp>().getArgument(0));
   EXPECT_EQ(result.getOffset(), cache.at(custom->getOperand(0)).getOffset());
+  EXPECT_TRUE(succeeded(verify(*module)));
+}
+
+TEST(OffsetAnalysisContext, NewBoundariesKeepLongPointerChainsLinear) {
+  MLIRContext context;
+  context.loadDialect<arith::ArithDialect, tensor::TensorDialect,
+                      triton::TritonDialect>();
+  // Distinct opaque inputs force boundary discovery at every addptr. Exercise
+  // both one root and successive roots in the same stable consumer context.
+  for (unsigned length : {8u, 32u}) {
+    for (bool incremental : {false, true}) {
+      std::string ir = "module { tt.func @chain(%base: !tt.ptr<i32>";
+      for (unsigned i = 0; i < length; ++i)
+        ir += ", %x" + std::to_string(i) + ": tensor<8xi64>";
+      ir += ") { %p0 = tt.splat %base : !tt.ptr<i32> -> tensor<8x!tt.ptr<i32>>\n";
+      for (unsigned i = 0; i < length; ++i)
+        ir += "%p" + std::to_string(i + 1) + " = tt.addptr %p" +
+              std::to_string(i) + ", %x" + std::to_string(i) +
+              " : tensor<8x!tt.ptr<i32>>, tensor<8xi64>\n";
+      ir += "tt.return } }";
+      auto module = parseSourceString<ModuleOp>(ir, &context);
+      ASSERT_TRUE(module);
+      auto f = *module->getOps<triton::FuncOp>().begin();
+      SmallVector<triton::AddPtrOp> pointers;
+      SmallVector<std::pair<Operation *, SmallVector<Value>>> original;
+      module->walk([&](Operation *op) {
+        original.emplace_back(op, llvm::to_vector(op->getOperands()));
+        if (auto p = dyn_cast<triton::AddPtrOp>(op))
+          pointers.push_back(p);
+      });
+      IRRewriter rewriter(&context);
+      llvm::DenseMap<Value, PtrOffsetInfo> cache;
+      OffsetAnalysisContext analysis(rewriter, cache, *module);
+      if (incremental) {
+        for (auto p : pointers)
+          parse(p.getResult(), p.getLoc(), analysis);
+      } else {
+        parse(pointers.back(), f.getLoc(), analysis);
+      }
+      unsigned additions = 0;
+      module->walk([&](arith::AddIOp op) { ++additions; });
+      // The offset tensor needs one sum per pointer link, independent of query
+      // order. Quadratic repeated prefixes must not be hidden by later DCE.
+      EXPECT_LE(additions, length);
+      auto &last = cache.at(pointers.back().getResult());
+      EXPECT_EQ(last.getPtr(), f.getArgument(0));
+      pointer::test::Environment inputs;
+      for (unsigned i = 0; i < length; ++i)
+        for (unsigned lane = 0; lane < 8; ++lane)
+          inputs[f.getArgument(i + 1)].emplace_back(64, i + lane);
+      auto values = pointer::test::evaluate(last.getOffset(), inputs);
+      ASSERT_TRUE(values);
+      ASSERT_EQ(values->size(), 8u);
+      for (unsigned lane = 0; lane < 8; ++lane)
+        EXPECT_EQ((*values)[lane].getSExtValue(),
+                  length * (length - 1) / 2 + length * lane);
+      for (const auto &[op, operands] : original)
+        EXPECT_EQ(llvm::to_vector(op->getOperands()), operands);
+      EXPECT_EQ(analysis.getGeneration(), 0u);
+      EXPECT_TRUE(succeeded(verify(*module)));
+    }
+  }
+}
+
+TEST(OffsetAnalysisContext, SourceNormalizationIsAnExplicitPhase) {
+  MLIRContext context;
+  context.loadDialect<arith::ArithDialect, tensor::TensorDialect,
+                      triton::TritonDialect>();
+  auto module = parseSourceString<ModuleOp>(R"mlir(
+    module { tt.func @prepare(%base: !tt.ptr<i32>, %x: tensor<2x4xi64>) {
+      %p = tt.splat %base : !tt.ptr<i32> -> tensor<2x4x!tt.ptr<i32>>
+      %ptr = tt.addptr %p, %x : tensor<2x4x!tt.ptr<i32>>, tensor<2x4xi64>
+      %flat = tt.reshape %ptr allow_reorder : tensor<2x4x!tt.ptr<i32>> -> tensor<8x!tt.ptr<i32>>
+      tt.return
+    } }
+  )mlir", &context);
+  ASSERT_TRUE(module);
+  auto f = *module->getOps<triton::FuncOp>().begin();
+  auto reshape = *f.getBody().front().getOps<triton::ReshapeOp>().begin();
+  IRRewriter rewriter(&context);
+  {
+    llvm::DenseMap<Value, PtrOffsetInfo> facts;
+    OffsetAnalysisContext analysis(rewriter, facts, *module);
+    parse(reshape.getResult(), reshape.getLoc(), analysis);
+    EXPECT_TRUE(reshape.getAllowReorder());
+    EXPECT_EQ(facts.at(reshape.getResult()).getPtr(), reshape.getResult());
+    EXPECT_EQ(analysis.getGeneration(), 0u);
+  }
+  normalizePointerAnalysisInputs(*module, rewriter);
+  EXPECT_FALSE(reshape.getAllowReorder());
+  auto attributes = reshape->getAttrDictionary();
+  auto operands = llvm::to_vector(reshape->getOperands());
+  {
+    llvm::DenseMap<Value, PtrOffsetInfo> facts;
+    OffsetAnalysisContext analysis(rewriter, facts, *module);
+    parse(reshape.getResult(), reshape.getLoc(), analysis);
+    EXPECT_EQ(facts.at(reshape.getResult()).getPtr(), f.getArgument(0));
+    EXPECT_EQ(reshape->getAttrDictionary(), attributes);
+    EXPECT_EQ(llvm::to_vector(reshape->getOperands()), operands);
+    EXPECT_EQ(analysis.getGeneration(), 0u);
+  }
+  unsigned before = 0, after = 0;
+  module->walk([&](Operation *) { ++before; });
+  normalizePointerAnalysisInputs(*module, rewriter);
+  module->walk([&](Operation *) { ++after; });
+  EXPECT_EQ(before, after);
   EXPECT_TRUE(succeeded(verify(*module)));
 }
