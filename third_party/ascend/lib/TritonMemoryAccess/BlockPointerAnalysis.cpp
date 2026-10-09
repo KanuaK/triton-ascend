@@ -21,10 +21,12 @@
  */
 
 #include "TritonMemoryAccess/BlockPointerAnalysis.h"
+#include "TritonMemoryAccess/BlockPointerAnalysisTransfer.h"
 #include "PointerAnalysisInternal.h"
 #include "TritonMemoryAccess/PointerAnalysisDriver.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include <algorithm>
 

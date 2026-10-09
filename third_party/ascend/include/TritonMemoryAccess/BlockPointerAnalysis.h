@@ -24,9 +24,11 @@
 #define TRITON_ASCEND_MEMORY_ACCESS_BLOCK_POINTER_ANALYSIS_H
 
 #include "TritonMemoryAccess/PointerAnalysis.h"
-#include "TritonMemoryAccess/PointerAnalysisTransfer.h"
-#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/IR/ConstantRange.h"
+
+namespace mlir::triton {
+class AdvanceOp;
+}
 
 namespace mlir::triton::pointer {
 
@@ -82,6 +84,7 @@ public:
   FailureOr<BlockPointerComponents> analyzeBlockPointer(Value value);
   FailureOr<BlockAdvanceDelta> analyzeBlockAdvanceDelta(triton::AdvanceOp op);
 
+  /// Borrowed entries have the same lifetime as PointerAnalysis cache entries.
   const OffsetComponents *findCachedOffset(Value value) const;
   const OffsetComponents *findCachedAddressDelta(Value value) const;
   const BlockPointerComponents *findCachedBlockPointer(Value value) const;
@@ -102,34 +105,6 @@ private:
   std::unique_ptr<Impl> impl;
 };
 
-namespace detail {
-
-struct BlockResult {
-  BasicResult basic;
-  std::optional<BlockPointerComponents> block;
-  std::optional<BlockAdvanceDelta> advanceDelta;
-};
-
-class BlockPointerRules {
-public:
-  using Result = BlockResult;
-  explicit BlockPointerRules(AnalysisOptions options) : basic(options) {}
-
-  std::optional<Result> resolveBoundary(AnalysisRequest request) const;
-  FailureOr<SmallVector<AnalysisRequest>>
-  collectInputs(AnalysisRequest request) const;
-  FailureOr<Result> transfer(AnalysisRequest request, ArrayRef<Result> inputs,
-                             OpBuilder &builder) const;
-  LogicalResult
-  mapResultValues(Result &result,
-                  llvm::function_ref<FailureOr<Value>(Value)> mapper) const;
-  AnalysisOptions getOptions() const { return basic.getOptions(); }
-
-private:
-  BasicPointerRules basic;
-};
-
-} // namespace detail
 
 } // namespace mlir::triton::pointer
 

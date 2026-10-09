@@ -22,6 +22,7 @@
 
 #include "PointerAnalysisTestUtils.h"
 #include "TritonMemoryAccess/BlockPointerAnalysis.h"
+#include "TritonMemoryAccess/BlockPointerAnalysisTransfer.h"
 #include "TritonMemoryAccess/PointerAnalysis.h"
 #include "TritonMemoryAccess/PointerAnalysisDriver.h"
 #include "TritonMemoryAccess/PointerAnalysisTransfer.h"
