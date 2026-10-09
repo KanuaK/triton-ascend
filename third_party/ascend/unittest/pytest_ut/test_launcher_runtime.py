@@ -292,28 +292,105 @@ def test_multiple_signatures_share_runtime():
     assert grid_out.item() == 0
 
 
-@pytest.mark.parametrize("taskqueue", [False, True])
-def test_cube_vector_workspace(monkeypatch, record_property, taskqueue):
+def _workspace_case(seed=11):
     from test_workspace_usage import matmul_mul_kernel
 
-    monkeypatch.setenv("TRITON_ENABLE_TASKQUEUE", str(taskqueue))
     # Integer-valued fp16 inputs give an exact CPU oracle. A2 emits a nonzero
     # workspace requirement; CANN on 950 may omit the workspace callback.
-    generator = torch.Generator().manual_seed(11)
+    generator = torch.Generator().manual_seed(seed)
     m, n, k = 256, 192, 32
     a, b, c = [torch.randint(-2, 3, shape, generator=generator).half() for shape in ((m, k), (k, n), (m, n))]
     expected = (a.float() @ b.float() * c.float()).half()
     a, b, c = (value.npu() for value in (a, b, c))
     out = torch.empty_like(c)
-    compiled = matmul_mul_kernel[(4, 3)](a, b, c, out, m, n, k, *a.stride(), *b.stride(), *c.stride(), *out.stride(),
-                                         BLOCK_M=64, BLOCK_N=64, BLOCK_K=32)
-    torch.npu.synchronize()
+    args = (a, b, c, out, m, n, k, *a.stride(), *b.stride(), *c.stride(), *out.stride())
+    compiled = matmul_mul_kernel.warmup(*args, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, grid=(4, 3))
+    compiled._init_handles()
     workspace = getattr(compiled.metadata, "workspace_size", 0)
     if not compiled.metadata.compile_on_910_95:
         assert workspace > 0
-    assert _native(compiled).launch_spec.workspace_size == max(workspace, 0)
+    return compiled, (*args, 64, 64, 32), expected
+
+
+@pytest.mark.parametrize("taskqueue", [False, True])
+def test_cube_vector_workspace(monkeypatch, record_property, taskqueue):
+    monkeypatch.setenv("TRITON_ENABLE_TASKQUEUE", str(taskqueue))
+    compiled, args, expected = _workspace_case()
+    instance = _native(compiled)
+    workspace = getattr(compiled.metadata, "workspace_size", 0)
+    assert instance.launch_spec.workspace_size == max(workspace, 0)
     record_property("workspace_bytes_per_block", workspace)
-    assert torch.equal(out.cpu(), expected)
+    _run(instance, compiled, args, grid=(4, 3, 1))
+    torch.npu.synchronize()
+    assert torch.equal(args[3].cpu(), expected)
+
+
+def _workspace_instance(compiled):
+    from types import SimpleNamespace
+
+    # Exercise host ownership on 950 too, even when its device binary does not
+    # consume workspace. The non-SIMT ABI always reserves the workspace slot.
+    metadata = compiled.metadata._asdict()
+    metadata["workspace_size"] = max(metadata.get("workspace_size", 0), 65536)
+    return driver.NPULauncher(compiled.src, SimpleNamespace(**metadata))
+
+
+@pytest.mark.parametrize("taskqueue", [False, True])
+@pytest.mark.parametrize("sync_each", [False, True])
+def test_workspace_is_released_after_execution(monkeypatch, record_property, taskqueue, sync_each):
+    monkeypatch.setenv("TRITON_ENABLE_TASKQUEUE", str(taskqueue))
+    compiled, args, expected = _workspace_case()
+    instance = _workspace_instance(compiled)
+    record_property("device_workspace_bytes_per_block", getattr(compiled.metadata, "workspace_size", 0))
+    record_property("launch_workspace_bytes_per_block", instance.launch_spec.workspace_size)
+    _run(instance, compiled, args, grid=(4, 3, 1))
+    torch.npu.synchronize()
+    before = torch.npu.memory_allocated()
+    for _ in range(64):
+        _run(instance, compiled, args, grid=(4, 3, 1))
+        if sync_each:
+            torch.npu.synchronize()
+    torch.npu.synchronize()
+    after = torch.npu.memory_allocated()
+    record_property("retained_workspace_growth_bytes", after - before)
+    assert torch.equal(args[3].cpu(), expected)
+    # Allow minor framework bookkeeping, but not one workspace per invocation.
+    # Check active allocations rather than allocator-reserved memory.
+    assert after <= before + 1024**2
+
+
+def test_workspace_streams_and_queued_plan_ownership(monkeypatch, record_property):
+    monkeypatch.setenv("TRITON_ENABLE_TASKQUEUE", "true")
+    streams = [torch.npu.Stream(), torch.npu.Stream()]
+    cases, instances = [], []
+    for index, stream in enumerate(streams):
+        compiled, args, expected = _workspace_case(seed=11 + index)
+        with torch.npu.stream(stream):
+            stream_id = driver.NPUDriver().get_current_stream()
+        cases.append((compiled, args, expected, stream_id))
+        instances.append(_workspace_instance(compiled))
+    torch.npu.synchronize()
+    for instance, (compiled, args, _, stream_id) in zip(instances, cases):
+        _run(instance, compiled, args, grid=(4, 3, 1), stream=stream_id)
+    torch.npu.synchronize()
+    before = torch.npu.memory_allocated()
+    for _ in range(32):
+        for instance, (compiled, args, _, stream_id) in zip(instances, cases):
+            # Submit from the default stream's context to explicit, distinct
+            # launch streams. Workspace reuse must follow the launch stream.
+            _run(instance, compiled, args, grid=(4, 3, 1), stream=stream_id)
+        scratch = torch.empty(65536 * 12, dtype=torch.uint8, device="npu")
+        scratch.fill_(165)
+        del scratch
+    del instance
+    instances.clear()
+    gc.collect()
+    torch.npu.synchronize()
+    after = torch.npu.memory_allocated()
+    record_property("retained_workspace_growth_bytes", after - before)
+    for _, args, expected, _ in cases:
+        assert torch.equal(args[3].cpu(), expected)
+    assert after <= before + 1024**2
 
 
 @triton.jit

@@ -103,10 +103,19 @@ inline cann_error getFfts(cann_stream stream, void **out) {
 }
 
 static cann_error execute(Invocation &call) {
+  // Framework queues can retain copies of the handler after it has run. Keep
+  // the workspace owner on this execution's stack, not in the retained call.
+  auto workspace = std::exchange(call.workspace, Allocation{});
   const auto &spec = call.plan->spec;
   const auto &layout = call.plan->layout;
   auto blocks = call.grid.physicalBlocks;
   bindDevice();
+  // A framework retry must acquire a fresh workspace after the previous
+  // execution released its owner.
+  if (spec.workspace_size && !workspace.owner)
+    workspace =
+        allocate(checkedMultiply(spec.workspace_size, call.grid.logicalBlocks),
+                 call.stream, false);
   if ((spec.flags & TRITON_NPU_GRID_WARNING) &&
       call.grid.logicalBlocks > spec.physical_blocks &&
       !call.plan->warned.exchange(true))
@@ -146,7 +155,7 @@ static cann_error execute(Invocation &call) {
       return ret;
     call.put(layout.lock, lock.data);
   }
-  call.put(layout.workspace, call.workspace.data);
+  call.put(layout.workspace, workspace.data);
   std::memcpy(call.data() + layout.grid, call.grid.grid.data(),
               3 * sizeof(int32_t));
 

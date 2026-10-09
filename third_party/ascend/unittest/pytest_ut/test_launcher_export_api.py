@@ -182,6 +182,26 @@ def test_c_api_invalid_grid_is_rejected_before_submission(native_api, config, gr
         assert message in error.value
 
 
+def test_c_api_releases_workspace_when_execution_preparation_fails(native_api):
+    import torch
+
+    # Overflow lock sizing after acquiring a small workspace, before any CANN
+    # kernel call. Exercise exception cleanup without submitting an invalid
+    # device kernel or exhausting memory.
+    with plan(native_api, [], workspace_size=65536, ordered_locks=2**63) as handle:
+        req = request()
+        req.grid[:] = (1, 1, 1)
+        req.stream = driver.NPUDriver().get_current_stream()
+        error = ct.create_string_buffer(256)
+        torch.npu.synchronize()
+        before = torch.npu.memory_allocated()
+        for _ in range(8):
+            ret = native_api.triton_npu_launch_v1(handle, ct.byref(req), None, None, 0, error, len(error))
+            assert ret == -1
+            assert b"size overflow" in error.value
+        assert torch.npu.memory_allocated() == before
+
+
 def test_c_api_request_version_and_bounded_error(native_api):
     with plan(native_api, []) as handle:
         req = request()
