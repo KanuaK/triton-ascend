@@ -62,15 +62,18 @@ inline void submit(std::function<cann_error()> call, const char *) {
 }
 #else
 struct BackendApi {
-  void *(*workspace)(uint64_t, void **);
+  void *(*workspace)(uint64_t, void *);
+  void (*releaseWorkspace)(void *);
   void *(*lock)(uint64_t, void *, void **);
   void (*release)(void *);
   void (*async)(void *, const char *);
 
   BackendApi() {
     void *handle = openRuntime(TRITON_NPU_UTILS_RELATIVE);
-    workspace =
-        resolve<decltype(workspace)>(handle, "triton_allocate_workspace");
+    workspace = resolve<decltype(workspace)>(
+        handle, "triton_allocate_workspace_on_stream");
+    releaseWorkspace =
+        resolve<decltype(releaseWorkspace)>(handle, "triton_release_workspace");
     lock = resolve<decltype(lock)>(handle, "triton_allocate_sync_block_lock");
     release =
         resolve<decltype(release)>(handle, "triton_release_retained_tensor");
@@ -84,13 +87,17 @@ inline BackendApi &backendApi() {
 inline void bindDevice() {}
 inline Allocation allocate(uint64_t size, cann_stream stream, bool isLock) {
   auto &api = backendApi();
+  if (!isLock) {
+    void *data = api.workspace(size, stream);
+    if (!data)
+      throw std::runtime_error("workspace allocation failed");
+    return {data, std::shared_ptr<void>(data, api.releaseWorkspace)};
+  }
   void *handle = nullptr;
-  void *data =
-      isLock ? api.lock(size, stream, &handle) : api.workspace(size, &handle);
+  void *data = api.lock(size, stream, &handle);
   std::shared_ptr<void> owner(handle, api.release);
   if (!data)
-    throw std::runtime_error(isLock ? "sync block lock allocation failed"
-                                    : "workspace allocation failed");
+    throw std::runtime_error("sync block lock allocation failed");
   return {data, std::move(owner)};
 }
 inline void submit(std::function<cann_error()> call, const char *name) {
