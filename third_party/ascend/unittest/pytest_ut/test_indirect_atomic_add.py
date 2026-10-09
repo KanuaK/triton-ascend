@@ -28,13 +28,15 @@
 #  | structured pointer + discrete mask              | (A1) | (A2) | (A3) | (A4) | (A5) |
 #  | partial structured: high-dim disc + low-dim cont|  -   | (B2) | (B3) | (B4) | (B5) |
 #  | fully unstructured indirect offsets             | (C1) | (C2) | (C3) | (C4) | (C5) |
+#  | scalar-splat mask + used atomic return value     | (D1) |  -   |  -   |  -   |  -   |
 #
 # Notes:
 # 1. Case A exercises the structured-pointer discrete-mask atomic_add path.
 # 2. Case B exercises a single high-dimension discrete remap with the
 #    remaining lower dimensions kept contiguous.
 # 3. Case C exercises fully unstructured indirect offsets.
-# 4. All cases validate both the final destination tensor and the atomic_add
+# 4. Case D checks masked-off invalid offsets when the atomic return is used.
+# 5. All cases validate both the final destination tensor and the atomic_add
 #    return value, which must be the old value observed at each access.
 # =============================================================================
 
@@ -77,6 +79,20 @@ PARTIAL_STRUCTURED_SHAPES = {
 
 TEST_RANKS = [3]
 TEST_DTYPE = [("int32", torch.int32), ("bfloat16", torch.bfloat16)]
+
+
+@triton.jit(do_not_specialize=["numel"])
+def scalar_splat_mask_atomic_add_return_value_1d(
+    idx_ptr,
+    out_ptr,
+    old_ptr,
+    numel,
+):
+    pid = tl.program_id(0)
+    offset = tl.load(idx_ptr + pid)
+    mask = pid < numel
+    old = tl.atomic_add(out_ptr + offset, 1, mask=mask)
+    tl.store(old_ptr + pid, old, mask=mask)
 
 
 @triton.jit
@@ -537,3 +553,34 @@ def test_atomic_add_fully_unstructured_indirect_offsets(dtype_name, torch_dtype,
     )
     _assert_equal(output, expected_output, dtype_name, rank, "fully-unstructured-indirect/output")
     _assert_equal(old, expected_old, dtype_name, rank, "fully-unstructured-indirect/old")
+
+
+def test_atomic_add_scalar_splat_mask_return_value_skips_oob_offsets():
+    numel = 3
+    grid_size = 8
+    invalid_offset = 1 << 30
+    old_sentinel = -777
+
+    offsets = torch.tensor(
+        [0, 1, 2] + [invalid_offset] * (grid_size - numel),
+        dtype=torch.int64,
+    ).npu()
+    baseline = torch.tensor([10, 20, 30], dtype=torch.int32)
+    output = baseline.clone().npu()
+    old = torch.full((grid_size, ), old_sentinel, dtype=torch.int32).npu()
+
+    scalar_splat_mask_atomic_add_return_value_1d[(grid_size, )](
+        offsets,
+        output,
+        old,
+        numel,
+    )
+    torch.npu.synchronize()
+
+    expected_output = baseline + 1
+    expected_old = torch.tensor(
+        [10, 20, 30] + [old_sentinel] * (grid_size - numel),
+        dtype=torch.int32,
+    )
+    _assert_equal(output, expected_output, "int32", 1, "scalar-splat-mask-return-value/output")
+    _assert_equal(old, expected_old, "int32", 1, "scalar-splat-mask-return-value/old")
