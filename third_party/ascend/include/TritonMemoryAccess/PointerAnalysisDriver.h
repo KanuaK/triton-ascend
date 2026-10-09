@@ -167,10 +167,15 @@ public:
     return found == cache.end() ? nullptr : &found->second;
   }
 
-  /// Updating a boundary invalidates all derived entries, not other bindings.
+  /// A new, unvisited request cannot be an input to a completed result: every
+  /// dependency is requested through analyze(). Preserve those results while
+  /// callers prepare further independent boundaries. Replacing an observed
+  /// request still invalidates all derived entries, not other bindings.
   void bindBoundary(AnalysisRequest request, Result result) {
-    cache.clear();
-    visits.clear();
+    if (lookupCompleted(request)) {
+      cache.clear();
+      visits.clear();
+    }
     bindings.insert_or_assign(request, std::move(result));
   }
 

@@ -567,6 +567,9 @@ void replacePtrArguments(triton::FuncOp funcOp,
   // This detached block owns the retired operations without revisiting them.
   Block retiredOps;
   IRRewriter rewriter(funcOp.getContext());
+  // Normalize source pointer producers before creating any analysis cache.
+  offsetMap.clear();
+  normalizePointerAnalysisInputs(funcOp, rewriter);
   OffsetAnalysisContext context(rewriter, offsetMap, funcOp);
   rewriter.setInsertionPointToStart(&funcOp.getBody().front());
   Value tempVar = rewriter

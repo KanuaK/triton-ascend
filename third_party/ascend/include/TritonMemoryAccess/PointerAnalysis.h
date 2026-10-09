@@ -52,7 +52,21 @@ struct OffsetComponents {
   OpFoldResult uniformOffset;
   SmallVector<OpFoldResult> strides;
   SmallVector<AxisKind> axes;
+
+  /// These queries describe facts in `domain`, not downstream legality.
+  bool hasAffineForm() const;
+  bool isUniform() const;
+  std::optional<OpFoldResult> getKnownStride(unsigned axis) const;
+  std::optional<OpFoldResult> getAffineOrigin() const;
 };
+
+/// Preserve an integer/index SSA value exactly without claiming tensor axes.
+/// ElementAddress requires an already converted i64 value; this does not cast.
+/// A rank-zero tensor's scalar origin may require a pure tensor.extract, placed
+/// after the value. The builder's insertion point is preserved.
+FailureOr<OffsetComponents> makeOpaqueOffset(
+    Value value, OpBuilder &builder,
+    ArithmeticDomain domain = ArithmeticDomain::SourceInteger);
 
 struct PointerComponents {
   Value base;
@@ -81,8 +95,14 @@ public:
   FailureOr<OffsetComponents> analyzeOffset(Value value);
   FailureOr<OffsetComponents> analyzeAddressDelta(Value value);
   FailureOr<PointerComponents> analyzePointer(Value pointer);
+  /// Borrowed cache entries: do not retain these pointers across bind*, clear,
+  /// successful remap, move assignment or destruction. Copies also contain SSA
+  /// references whose validity depends on the caller keeping the IR stable.
   const OffsetComponents *findCachedOffset(Value value) const;
   const OffsetComponents *findCachedAddressDelta(Value value) const;
+  /// Bindings are caller-proven equalities. Type/shape/domain checks do not
+  /// prove numerical equivalence. Replacing a binding or a previously analyzed
+  /// boundary invalidates derived entries; an unseen boundary preserves them.
   LogicalResult bindOffset(Value boundary, const OffsetComponents &components);
   LogicalResult bindPointer(Value boundary,
                             const PointerComponents &components);
