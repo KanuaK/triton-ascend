@@ -1,3 +1,8 @@
+import re
+import shutil
+import subprocess
+
+import pytest
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,3 +139,48 @@ def test_npu_launcher_exposes_launcher_so_path(
         metadata,
     )
     mock_launcher_stub.assert_called_with("// header src", "// wrapper src", False)
+
+
+@pytest.mark.parametrize("layout,blocks,mix,subblocks,expected_size,headers", [
+    (8, 2, "aiv", False, 64, {}),  # Legacy ordered lock, low word is i64 slots.
+    (1 << 32, 2, "aiv", False, 320, {0: 2}),
+    (1 << 32, 2, "mix", False, 320, {0: 2}),
+    (1 << 32, 2, "mix", True, 576, {0: 4}),
+    ((2 << 32) | 16, 4, "aiv", False, 1280, {16: 4, 88: 4}),
+])
+def test_sync_lock_layout_in_both_launch_paths(tmp_path, layout, blocks, mix, subblocks, expected_size, headers):
+    cxx = shutil.which("c++")
+    if cxx is None:
+        pytest.skip("C++ compiler is required for the generated launcher check")
+    metadata = _make_metadata()
+    metadata.lock_num = layout
+    metadata.mix_mode = mix
+    metadata.auto_tile_and_bind_subblock = subblocks
+    with patch.object(driver, "NPUUtils") as utils, \
+         patch.object(driver, "_is_auto_map_parallel_blocks_enabled", return_value=False), \
+         patch.object(driver, "force_disable_ffts", return_value=False), \
+         patch.object(driver, "is_ffts_supported", return_value=True), \
+         patch.object(driver, "get_ascend_arch_from_env", return_value="Ascend950PR_9579"), \
+         patch.object(driver, "get_backend_func", side_effect=_mock_backend_func):
+        utils.return_value.get_aivector_core_num.return_value = 56
+        utils.return_value.get_aicore_num.return_value = 28
+        source = driver.generate_npu_wrapper_src({}, {0: "*i32"}, metadata)
+    # Execute the allocation and header initialization emitted into BOTH entry
+    # points. The expected values are the NPU-IR wire protocol, not a second
+    # copy of the launcher's layout calculation.
+    layouts = re.findall(r"const uint64_t orderedLockI64 =.*?syncBlockLockSize = .*?;", source, re.S)
+    initializers = re.findall(r"std::vector<int64_t> lockInitData.*?\n    }", source, re.S)
+    assert len(layouts) == len(initializers) == 2
+    checks = []
+    for layout_source, initializer in zip(layouts, initializers):
+        checks.append("{\n" + layout_source + "\n" + initializer +
+                      f"\nif (syncBlockLockSize != {expected_size}) return 1;\n")
+        for i in range(expected_size // 8):
+            checks.append(f"if (lockInitData[{i}] != {headers.get(i, 0)}) return 2;\n")
+        checks.append("}\n")
+    cpp = tmp_path / "lock_layout.cpp"
+    cpp.write_text("#include <cstdint>\n#include <vector>\nint main() {\n" + f"uint32_t blockNum = {blocks};\n" +
+                   "".join(checks) + "}\n")
+    binary = tmp_path / "lock_layout"
+    subprocess.run([cxx, "-std=c++17", str(cpp), "-o", str(binary)], check=True, capture_output=True)
+    subprocess.run([str(binary)], check=True)

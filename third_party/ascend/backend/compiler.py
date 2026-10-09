@@ -87,7 +87,7 @@ def _get_then_remove_rc(mod, attr_name: str) -> int:
 
     if remove_attr:
         remove_attr(mod, attr_name)
-    
+
     if not isinstance(attr_value, int):
         return -1
 
@@ -321,6 +321,17 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
         metadata["has_auto_blockify_blacklist_op"] = True
     # the mix mode is also encoded into metadata['name'] for runtime to distinguish
     metadata["mix_mode"] = re.search(MIX_MODE_REGEX, linalg).group(1)
+    # Pure AIV unordered locks have no subblock participants. Mixed kernels
+    # retain subblock tiling and use (block, subblock) as the lock identity.
+    has_unordered_lock = bool(
+        re.search(r"sync_block_lock_unordered|sync_block_lock\s*\{[^}]*ordering\s*=\s*#hivm\.ordering<unordered>",
+                  linalg))
+    if has_unordered_lock:
+        if metadata["mix_mode"] != "mix":
+            metadata["auto_tile_and_bind_subblock"] = False
+        # One unordered lock until the compiler callback supplies the layout.
+        metadata["lock_num"] = 1 << 32
+        metadata["lock_init_val"] = 0
     metadata["parallel_mode"] = re.search(PARALLEL_MODE_REGEX, linalg).group(1)
     metadata["kernel_name"] = re.search(KERNEL_NAME_REGEX, linalg).group(1)
     # Check the function load_binary in npu_driver.py.
@@ -373,6 +384,21 @@ def get_common_bishengir_compile_options(metadata):
     bishengir_target = metadata['target'].arch
     bishengir_target_opt = f"--target={bishengir_target}"
     return [bishengir_target_opt]
+
+
+def _needs_lib_call_no_inline(metadata):
+    """Return whether the target needs the CANN 9.1 hacc.noinline workaround."""
+    return metadata['target'].arch.startswith("Ascend950")
+
+
+@functools.lru_cache()
+def _npu_compiler_supports_option(compiler_path: str, option: str) -> bool:
+    try:
+        result = subprocess.run([compiler_path, "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return option in result.stdout
 
 
 def get_auto_bind_sub_block_option(metadata):
@@ -575,7 +601,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if enable_vf_fusion is not None:
             _compile_option_list += \
                 [f"--enable-vf-fusion={enable_vf_fusion}"]
-                
+
         enable_vf_operand_substitution = metadata["enable_vf_operand_substitution"]
         if enable_vf_operand_substitution:
             _compile_option_list += \
@@ -623,6 +649,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 "--enable-hfusion-compile=true",
                 "--enable-triton-kernel-compile=true",
             ]
+            if (_needs_lib_call_no_inline(metadata)
+                    and _npu_compiler_supports_option(npu_compiler_path, "--enable-lib-call-no-inline")):
+                _compile_option_list += ["--enable-lib-call-no-inline=false"]
         bisheng_options = metadata["bisheng_options"]
         if bisheng_options is not None:
             _compile_option_list += [
@@ -867,6 +896,9 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
                 bishengir_hivm_opt,
                 "--enable-triton-kernel-compile=true",
             ]
+            if (_needs_lib_call_no_inline(metadata)
+                    and _npu_compiler_supports_option(npu_compiler_path, "--enable-lib-call-no-inline")):
+                _compile_option_list += ["--enable-lib-call-no-inline=false"]
 
         _compile_option_list += ["--mlir-print-ir-after-failure"]
         _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
@@ -1127,7 +1159,7 @@ def ttir_to_npubin(mod, metadata, opt):
 
 
 def get_simt_stack_limit():
-    # simt_stack_limit resolution precedence: 
+    # simt_stack_limit resolution precedence:
     #  1.torch_npu's acl_default.json "StackSize":{"simt_stack_size":N}
     #    takes precedence and the user-specified value is ignored.
     #  2.if that config key is absent ,fail back to the kernel-time

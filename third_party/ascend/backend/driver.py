@@ -148,7 +148,7 @@ class NPUUtils(object):
         prop = torch.npu.get_device_properties(device)
         cube_core_num, vector_core_num = prop.cube_core_num, prop.vector_core_num
         return cube_core_num, vector_core_num
-    
+
     @functools.lru_cache()
     def get_device_properties(self, device):
         # temperoarily added "max_shared_mem" properties to avoid triton-compiler complain
@@ -213,7 +213,7 @@ class NPULauncher(object):
         else:
             if self.compile_only:
                 return
-  
+
             profiler_registered = self.launch(*args, **kwargs)
             _ascend_utils.TRITON_PROFILER_REGISTERED = (profiler_registered == 1)
 
@@ -494,8 +494,29 @@ def generate_npu_wrapper_src(constants, signature, metadata):
         else metadata.lock_init_val if hasattr(metadata, 'lock_init_val')
         else 0
     )
-    lock_num = int(metadata.lock_num) \
-                          if hasattr(metadata, 'lock_num') else -1
+    # The callback keeps its legacy name, but now packs unordered lock count
+    # in the high 32 bits and ordered i64 slots in the low 32 bits. Older
+    # compilers return only the latter, so their allocation remains unchanged.
+    lock_layout = max(0, int(getattr(metadata, "lock_num", 0)))
+    ordered_lock_i64 = lock_layout & 0xFFFFFFFF
+    unordered_lock_count = lock_layout >> 32
+    has_sync_block_lock = lock_layout > 0
+    bind_subblocks = getattr(metadata, "enable_auto_bind_sub_block", None)
+    if bind_subblocks is None:
+        bind_subblocks = getattr(metadata, "auto_tile_and_bind_subblock", False)
+    participant_factor = 2 if metadata.mix_mode == "mix" and bind_subblocks else 1
+    lock_layout_stmt = f"""
+    const uint64_t orderedLockI64 = {ordered_lock_i64};
+    const uint64_t unorderedLockCount = {unordered_lock_count};
+    const uint64_t lockParticipantNum = blockNum * {participant_factor};
+    const uint64_t unorderedLockStrideI64 = (1 + 2 * lockParticipantNum) * 8;
+    const uint64_t lockI64Count = orderedLockI64 + unorderedLockCount * unorderedLockStrideI64;
+    const uint64_t syncBlockLockSize = lockI64Count * sizeof(int64_t);"""
+    lock_init_stmt = f"""
+    std::vector<int64_t> lockInitData(lockI64Count, {lock_init_value});
+    for (uint64_t i = 0; i < unorderedLockCount; ++i) {{
+      lockInitData[orderedLockI64 + i * unorderedLockStrideI64] = lockParticipantNum;
+    }}"""
     bs_task_type = metadata.bs_task_type if hasattr(metadata, 'bs_task_type') else 0
     mix_mode = metadata.mix_mode
     compile_on_910_95 = metadata.compile_on_910_95
@@ -992,13 +1013,13 @@ void triton_launch_kernel(
     void *syncBlockLock_handle = NULL;
     uint16_t ModuleId = 0;
     {f'''
-    uint64_t syncBlockLockSize = {lock_num} * sizeof(int64_t);
+    {lock_layout_stmt}
     {get_backend_func("allocate_sync_block_lock", "syncBlockLockSize", "stream")}
     std::shared_ptr<void> syncBlockLock_handle_guard(syncBlockLock_handle, release_npu_tensor_handle);
     if (!syncBlockLock_ptr) {{
       {alloc_success_code if enable_taskqueue else sync_lock_fail_code}
     }}
-    std::vector<int64_t> lockInitData({lock_num}, {lock_init_value});
+    {lock_init_stmt}
     ret = cann_memcpy(
         syncBlockLock_ptr, syncBlockLockSize,
         reinterpret_cast<void *>(lockInitData.data()), syncBlockLockSize,
@@ -1007,7 +1028,7 @@ void triton_launch_kernel(
     if (ret != CANN_SUCCESS) {{
       return {'ret' if enable_taskqueue else ''};
     }}
-    ''' if lock_num > 0 else ''}
+    ''' if has_sync_block_lock else ''}
     {'if (ret != CANN_SUCCESS) return ret;' if (workspace_size > 0 and enable_taskqueue) else 'if (ret != CANN_SUCCESS) return;' if (workspace_size > 0 and not enable_taskqueue) else ''}
 
     size_t args_offset = 0;
@@ -1098,13 +1119,13 @@ static void _launch(const char* kernelName, cann_func_handle func, cann_stream s
     void *syncBlockLock_handle = NULL;
     uint16_t ModuleId = 0;
     {f'''
-    uint64_t syncBlockLockSize = {lock_num} * sizeof(int64_t);
+    {lock_layout_stmt}
     {get_backend_func("allocate_sync_block_lock", "syncBlockLockSize", "stream")}
     std::shared_ptr<void> syncBlockLock_handle_guard(syncBlockLock_handle, release_npu_tensor_handle);
     if (!syncBlockLock_ptr) {{
       {alloc_success_code if enable_taskqueue else sync_lock_fail_code}
     }}
-    std::vector<int64_t> lockInitData({lock_num}, {lock_init_value});
+    {lock_init_stmt}
     ret = rtMemcpy(
         syncBlockLock_ptr, syncBlockLockSize,
         reinterpret_cast<void *>(lockInitData.data()), syncBlockLockSize,
@@ -1113,7 +1134,7 @@ static void _launch(const char* kernelName, cann_func_handle func, cann_stream s
     if (ret != CANN_SUCCESS) {{
       return {'ret' if enable_taskqueue else ''};
     }}
-    ''' if lock_num > 0 else ''}
+    ''' if has_sync_block_lock else ''}
     {'if (ret != CANN_SUCCESS) return ret;' if (workspace_size > 0 and enable_taskqueue) else 'if (ret != CANN_SUCCESS) return;' if (workspace_size > 0 and not enable_taskqueue) else ''}
     struct __attribute__((packed)) {{
       {'void* ffts_addr __attribute__((aligned(8)));' if target_support_ffts else ''}
@@ -1124,7 +1145,7 @@ static void _launch(const char* kernelName, cann_func_handle func, cann_stream s
       {'void* DTData __attribute__((aligned(8)));' if enable_device_print else ''}
     }} args = {{
       {'static_cast<void*>(ffts_addr),' if target_support_ffts else ''}
-      {('static_cast<void*>(syncBlockLock_ptr),' if lock_num > 0 else 'nullptr,') if not metadata.force_simt_only else ''}
+      {('static_cast<void*>(syncBlockLock_ptr),' if has_sync_block_lock else 'nullptr,') if not metadata.force_simt_only else ''}
       {('static_cast<void*>(workspace_addr_ptr),' if workspace_size > 0 else 'nullptr,') if not metadata.force_simt_only else ''}
       {(lambda _rt: (', '.join(_rt) + ',') if _rt else '')(
         [f'static_cast<{_ty_to_cpp(ty)}>(arg{i})' for i, ty in signature.items() if i not in constants]
