@@ -1250,37 +1250,27 @@ void TritonToUnstructurePass::runOnOperation() {
   }
 
   IRRewriter analysisRewriter(ctx);
+  // Hoisting and argument replacement can introduce new carrier expressions.
+  // Complete their source normalization before either stable parsing phase.
+  normalizePointerAnalysisInputs(moduleOp, analysisRewriter);
   {
     OffsetAnalysisContext context(analysisRewriter, offsetMapForLoopArgs,
                                   moduleOp);
-    unsigned generation;
-    do {
-      generation = context.getGeneration();
-      moduleOp->walk([&](LoopLikeOpInterface op) { runPreparse(op, context); });
-    } while (generation != context.getGeneration());
+    moduleOp->walk([&](LoopLikeOpInterface op) { runPreparse(op, context); });
   }
   {
     OffsetAnalysisContext context(analysisRewriter, offsetMap, moduleOp);
-    // Local normalization can reset the session and invalidate an earlier
-    // memory operation's imported facts. Finish a stable sweep before handing
-    // the complete table to patterns. Normalizations only consume markers or
-    // replace carrier operands, so the next sweep reuses the local boundaries.
-    unsigned generation;
-    do {
-      generation = context.getGeneration();
-      fromTensorArg.clear();
-      moduleOp->walk([&](Operation *op) {
-        if (auto loadOp = dyn_cast<triton::LoadOp>(op)) {
-          runParse(loadOp, context);
-        } else if (auto storeOp = dyn_cast<triton::StoreOp>(op)) {
-          runParse(storeOp, context);
-        } else if (auto atomicRMWOp = dyn_cast<triton::AtomicRMWOp>(op)) {
-          runParse(atomicRMWOp, context);
-        } else if (auto atomicCASOp = dyn_cast<triton::AtomicCASOp>(op)) {
-          runParse(atomicCASOp, context);
-        }
-      });
-    } while (generation != context.getGeneration());
+    moduleOp->walk([&](Operation *op) {
+      if (auto loadOp = dyn_cast<triton::LoadOp>(op)) {
+        runParse(loadOp, context);
+      } else if (auto storeOp = dyn_cast<triton::StoreOp>(op)) {
+        runParse(storeOp, context);
+      } else if (auto atomicRMWOp = dyn_cast<triton::AtomicRMWOp>(op)) {
+        runParse(atomicRMWOp, context);
+      } else if (auto atomicCASOp = dyn_cast<triton::AtomicCASOp>(op)) {
+        runParse(atomicCASOp, context);
+      }
+    });
   }
 
   RewritePatternSet patterns(ctx);

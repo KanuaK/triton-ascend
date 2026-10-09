@@ -167,6 +167,11 @@ TEST(PointerAnalysis, AKnownAxisSurvivesAnUnrelatedOpaqueAxis) {
   EXPECT_EQ(scalar(result->uniformOffset), 0);
   EXPECT_EQ(scalar(result->strides[0]), 0);
   EXPECT_EQ(scalar(result->strides[1]), 1);
+  EXPECT_FALSE(result->hasAffineForm());
+  EXPECT_FALSE(result->getAffineOrigin());
+  EXPECT_FALSE(result->getKnownStride(0));
+  ASSERT_TRUE(result->getKnownStride(1));
+  EXPECT_EQ(scalar(*result->getKnownStride(1)), 1);
   EXPECT_TRUE(succeeded(verify(*module)));
 }
 
@@ -877,6 +882,62 @@ TEST(PointerAnalysis, RankZeroIndexAndEncodedTensorKeepTheirTypes) {
       }
       EXPECT_TRUE(succeeded(verify(module)));
     }
+}
+
+TEST(PointerAnalysis, OpaqueFactoryPreservesDomainAndRankZeroContracts) {
+  EXPECT_FALSE(OffsetComponents{}.hasAffineForm());
+  EXPECT_FALSE(OffsetComponents{}.isUniform());
+  EXPECT_FALSE(OffsetComponents{}.getAffineOrigin());
+  EXPECT_FALSE(OffsetComponents{}.getKnownStride(0));
+  MLIRContext context;
+  context.loadDialect<arith::ArithDialect, tensor::TensorDialect,
+                      triton::TritonDialect>();
+  auto module = parseSourceString<ModuleOp>(R"mlir(
+    module { tt.func @opaque(%scalar: i32, %lanes: tensor<4xi64>,
+                            %rankzero: tensor<i64>, %idx: index, %float: f32) {
+      tt.return
+    } }
+  )mlir", &context);
+  ASSERT_TRUE(module);
+  auto f = *module->getOps<triton::FuncOp>().begin();
+  OpBuilder builder(&context);
+  builder.setInsertionPoint(f.getBody().front().getTerminator());
+  auto point = builder.getInsertionPoint();
+  auto scalar = makeOpaqueOffset(f.getArgument(0), builder);
+  ASSERT_TRUE(succeeded(scalar));
+  EXPECT_TRUE(scalar->hasAffineForm());
+  EXPECT_TRUE(scalar->isUniform());
+  ASSERT_TRUE(scalar->getAffineOrigin());
+  EXPECT_EQ(*scalar->getAffineOrigin(), OpFoldResult(f.getArgument(0)));
+  EXPECT_FALSE(scalar->getKnownStride(0));
+  EXPECT_TRUE(failed(makeOpaqueOffset(f.getArgument(0), builder,
+                                      ArithmeticDomain::ElementAddress)));
+  EXPECT_TRUE(failed(makeOpaqueOffset(f.getArgument(4), builder)));
+  EXPECT_TRUE(failed(makeOpaqueOffset(Value(), builder)));
+  EXPECT_TRUE(succeeded(makeOpaqueOffset(f.getArgument(3), builder)));
+  auto lanes = makeOpaqueOffset(f.getArgument(1), builder,
+                                 ArithmeticDomain::ElementAddress);
+  ASSERT_TRUE(succeeded(lanes));
+  EXPECT_EQ(lanes->completeOffset, OpFoldResult(f.getArgument(1)));
+  EXPECT_EQ(lanes->domain, ArithmeticDomain::ElementAddress);
+  EXPECT_FALSE(lanes->hasAffineForm());
+  EXPECT_FALSE(lanes->isUniform());
+  EXPECT_FALSE(lanes->getAffineOrigin());
+  EXPECT_FALSE(lanes->getKnownStride(0));
+  EXPECT_FALSE(lanes->getKnownStride(1));
+  auto rankzero = makeOpaqueOffset(f.getArgument(2), builder);
+  ASSERT_TRUE(succeeded(rankzero));
+  ASSERT_TRUE(rankzero->getAffineOrigin());
+  Value origin = cast<Value>(*rankzero->getAffineOrigin());
+  EXPECT_TRUE(origin.getType().isInteger(64));
+  EXPECT_TRUE(origin.getDefiningOp<tensor::ExtractOp>());
+  EXPECT_EQ(builder.getInsertionPoint(), point);
+  test::Environment inputs;
+  inputs[f.getArgument(2)] = {llvm::APInt(64, -19)};
+  auto evaluated = evaluate(origin, inputs);
+  ASSERT_TRUE(evaluated);
+  EXPECT_EQ(evaluated->front().getSExtValue(), -19);
+  EXPECT_TRUE(succeeded(verify(*module)));
 }
 
 } // namespace

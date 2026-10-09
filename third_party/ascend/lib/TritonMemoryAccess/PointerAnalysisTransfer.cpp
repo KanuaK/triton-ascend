@@ -61,43 +61,6 @@ OpFoldResult integerAttr(Type type, const llvm::APInt &value,
   return scalarIntegerAttr(type, value, builder);
 }
 
-bool allKnown(const OffsetComponents &value) {
-  return llvm::none_of(value.axes,
-                       [](AxisKind axis) { return axis == AxisKind::Unknown; });
-}
-
-bool allInvariant(const OffsetComponents &value) {
-  return llvm::all_of(
-      value.axes, [](AxisKind axis) { return axis == AxisKind::Invariant; });
-}
-
-OffsetComponents opaqueOffset(Value value, Type scalarType,
-                              OpBuilder &builder) {
-  OffsetComponents result;
-  result.valueType = value.getType();
-  result.domain = ArithmeticDomain::SourceInteger;
-  result.shape = getLogicalShape(value.getType());
-  result.completeOffset = value;
-  result.axes.assign(result.shape.size(), AxisKind::Unknown);
-  result.strides.assign(result.shape.size(),
-                        builder.getIntegerAttr(scalarType, 0));
-  if (!isa<RankedTensorType>(value.getType())) {
-    result.uniformOffset = value;
-  } else if (result.shape.empty()) {
-    // Rank-zero tensors have one lane, but c is still a scalar. Preserve an
-    // existing splat source; otherwise extract the unique element numerically.
-    if (auto splat = value.getDefiningOp<triton::SplatOp>())
-      result.uniformOffset = splat.getSrc();
-    else
-      result.uniformOffset =
-          builder.create<tensor::ExtractOp>(value.getLoc(), value, ValueRange{})
-              .getResult();
-  } else {
-    result.uniformOffset = builder.getIntegerAttr(scalarType, 0);
-  }
-  return result;
-}
-
 FailureOr<OffsetComponents> invariantOffset(Value value, OpFoldResult scalar,
                                             OpBuilder &builder) {
   OffsetComponents result;
@@ -138,7 +101,10 @@ combineOffsets(Value complete, const OffsetComponents &lhs,
       lhs.shape != rhs.shape)
     return failure();
   Type scalar = getIntegerElementType(complete.getType());
-  OffsetComponents result = opaqueOffset(complete, scalar, builder);
+  auto opaque = makeOpaqueOffset(complete, builder);
+  if (failed(opaque))
+    return failure();
+  OffsetComponents result = std::move(*opaque);
   result.domain = lhs.domain;
   result.axes.clear();
   result.strides.clear();
@@ -161,7 +127,7 @@ combineOffsets(Value complete, const OffsetComponents &lhs,
                               : AxisKind::Structured);
     result.strides.push_back(*stride);
   }
-  if (allKnown(result)) {
+  if (result.hasAffineForm()) {
     FailureOr<OpFoldResult> uniform =
         combine(kind, lhs.uniformOffset, rhs.uniformOffset, scalar, options,
                 builder, loc);
@@ -175,9 +141,9 @@ combineOffsets(Value complete, const OffsetComponents &lhs,
 /// Check the lifted scalar affine expression before sign extension. Unknown
 /// scalar bounds cannot justify moving a modular iN formula into i64.
 bool affineFitsSigned(const OffsetComponents &source, unsigned width) {
-  if (source.shape.size() != source.strides.size() || !allKnown(source))
+  if (!source.hasAffineForm())
     return false;
-  if (allInvariant(source))
+  if (source.isUniform())
     return true;
   if (width >= 64)
     return false;
@@ -249,7 +215,7 @@ FailureOr<OffsetComponents> projectAddress(Value value,
     result.strides[axis] = *stride;
   }
   result.uniformOffset = builder.getIntegerAttr(scalarType, 0);
-  if (allKnown(result)) {
+  if (result.hasAffineForm()) {
     if (!isa<RankedTensorType>(result.valueType)) {
       // A scalar's complete value is its uniform value. Reuse the same cast
       // rather than inserting two identical extension helpers.
@@ -352,7 +318,7 @@ FailureOr<PointerComponents> addPointerOffsets(Value resultValue,
                                : AxisKind::Structured);
     offsets.strides.push_back(*stride);
   }
-  if (allKnown(offsets)) {
+  if (offsets.hasAffineForm()) {
     FailureOr<OpFoldResult> uniform = combine(
         BinaryKind::Add, parent.offsets.uniformOffset, delta.uniformOffset,
         builder.getI64Type(), options, builder, loc);
@@ -457,7 +423,10 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
     if (failed(width))
       return failure();
     Type scalar = getIntegerElementType(value.getType());
-    OffsetComponents state = opaqueOffset(value, scalar, builder);
+    auto opaque = makeOpaqueOffset(value, builder);
+    if (failed(opaque))
+      return failure();
+    OffsetComponents state = std::move(*opaque);
     llvm::ConstantRange range = getValueRange(value, *width);
     if (auto makeRange = value.getDefiningOp<triton::MakeRangeOp>()) {
       if (state.shape.size() != 1 || state.shape[0] <= 0 || *width != 32)
@@ -487,8 +456,8 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
         state = left;
         state.completeOffset = value;
       } else if (select.getCondition().getType().isInteger(1) &&
-                 sameShape(left.valueType, right.valueType) && allKnown(left) &&
-                 allKnown(right)) {
+                 sameShape(left.valueType, right.valueType) &&
+                 left.hasAffineForm() && right.hasAffineForm()) {
         auto choose = [&](OpFoldResult lhs,
                           OpFoldResult rhs) -> FailureOr<OpFoldResult> {
           if (lhs == rhs)
@@ -544,7 +513,7 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
           state.strides[axis] = builder.getIntegerAttr(scalar, 0);
         }
       }
-      if (allKnown(state))
+      if (state.hasAffineForm())
         state.uniformOffset = src.uniformOffset;
       range = *inputs.front().integerRange;
     } else if (auto expand = value.getDefiningOp<triton::ExpandDimsOp>()) {
@@ -559,7 +528,7 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
       state.strides = src.strides;
       state.strides.insert(state.strides.begin() + axis,
                            builder.getIntegerAttr(scalar, 0));
-      if (allKnown(state))
+      if (state.hasAffineForm())
         state.uniformOffset = src.uniformOffset;
       range = *inputs.front().integerRange;
     } else if (value.getDefiningOp<arith::AddIOp>() ||
@@ -587,8 +556,8 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
       if (left.shape != right.shape ||
           !sameShape(left.valueType, right.valueType))
         return failure();
-      bool leftUniform = allInvariant(left);
-      bool rightUniform = allInvariant(right);
+      bool leftUniform = left.isUniform();
+      bool rightUniform = right.isUniform();
       if (leftUniform || rightUniform) {
         const auto &varying = leftUniform ? right : left;
         const auto &scale = leftUniform ? left : right;
@@ -606,7 +575,7 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
             return failure();
           state.strides.push_back(*stride);
         }
-        if (allKnown(state)) {
+        if (state.hasAffineForm()) {
           FailureOr<OpFoldResult> uniform = combine(
               BinaryKind::Multiply, varying.uniformOffset, scale.uniformOffset,
               scalar, options, builder, value.getLoc());
@@ -652,7 +621,7 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
           return failure();
         state.strides.push_back(*converted);
       }
-      if (allKnown(state)) {
+      if (state.hasAffineForm()) {
         FailureOr<OpFoldResult> converted = foldOrCreateCast(
             src.uniformOffset, scalar,
             unsignedCast ? CastKind::Unsigned : CastKind::Signed, options,
@@ -780,8 +749,11 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
         return failure();
       Value full = builder.create<arith::SelectOp>(
           value.getLoc(), select.getCondition(), *yes, *no);
-      result.offsets = opaqueOffset(full, builder.getI64Type(), builder);
-      result.offsets.domain = ArithmeticDomain::ElementAddress;
+      auto opaque =
+          makeOpaqueOffset(full, builder, ArithmeticDomain::ElementAddress);
+      if (failed(opaque))
+        return failure();
+      result.offsets = std::move(*opaque);
       Result wrapped;
       wrapped.pointer = std::move(result);
       return wrapped;

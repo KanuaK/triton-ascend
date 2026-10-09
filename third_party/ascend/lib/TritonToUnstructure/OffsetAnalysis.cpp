@@ -412,6 +412,81 @@ bool getRecoverableCarrierAxes(const PtrOffsetInfo &carrierInfo, unsigned rank,
 
 } // namespace
 
+void normalizePointerAnalysisInputs(Operation *scope, RewriterBase &rewriter) {
+  // Snapshot candidates: classification may insert pure helpers, but it must
+  // not change the traversal or the original operands until its context ends.
+  SmallVector<Operation *> candidates;
+  scope->walk([&](Operation *op) {
+    if (auto reshape = dyn_cast<triton::ReshapeOp>(op)) {
+      auto type = cast<RankedTensorType>(reshape.getType());
+      if (reshape.getAllowReorder() && !type.getEncoding() &&
+          isa<triton::PointerType>(type.getElementType()))
+        candidates.push_back(op);
+    } else if (isa<triton::AddPtrOp>(op) &&
+               op->hasAttr(controlflow::kPointerDescriptorRebuildAttr)) {
+      candidates.push_back(op);
+    }
+  });
+
+  for (Operation *op : candidates) {
+    if (auto reshape = dyn_cast<triton::ReshapeOp>(op)) {
+      bool hasScalarBase = false;
+      {
+        llvm::DenseMap<Value, PtrOffsetInfo> facts;
+        OffsetAnalysisContext context(rewriter, facts, scope);
+        parse(reshape.getSrc(), reshape.getLoc(), context);
+        const auto &info = facts.at(reshape.getSrc());
+        hasScalarBase = info.getPtr() && isScalarPointer(info.getPtr()) &&
+                        info.getOffset();
+      }
+      if (hasScalarBase)
+        rewriter.modifyOpInPlace(reshape,
+                                 [&] { reshape->removeAttr("allow_reorder"); });
+      continue;
+    }
+
+    auto add = cast<triton::AddPtrOp>(op);
+    auto axes = op->getAttrOfType<DenseI32ArrayAttr>(
+        controlflow::kPointerDescriptorStructuredAxesAttr);
+    auto resultType = dyn_cast<RankedTensorType>(add.getType());
+    auto offsetType = dyn_cast<RankedTensorType>(add.getOffset().getType());
+    auto splat = add.getPtr().getDefiningOp<triton::SplatOp>();
+    if (op->hasAttr(controlflow::kPointerDescriptorOffsetFormAttr) || !axes ||
+        !resultType || !offsetType || !splat ||
+        !isScalarPointer(splat.getSrc()) ||
+        axes.size() != static_cast<size_t>(resultType.getRank()) ||
+        axes.empty() || !llvm::all_of(axes.asArrayRef(), [](int32_t a) {
+          return a == 0;
+        }) ||
+        resultType.getShape() != offsetType.getShape() ||
+        resultType.getEncoding() != offsetType.getEncoding())
+      continue;
+    auto integer = dyn_cast<IntegerType>(offsetType.getElementType());
+    if (!integer || integer.getWidth() > 64)
+      continue;
+
+    SmallVector<PtrOffsetInfo::AxisInfo> recoveredAxes;
+    {
+      llvm::DenseMap<Value, PtrOffsetInfo> facts;
+      OffsetAnalysisContext context(rewriter, facts, scope);
+      parse(add.getOffset(), add.getLoc(), context);
+      if (!getRecoverableCarrierAxes(facts.at(add.getOffset()),
+                                    resultType.getRank(), recoveredAxes))
+        continue;
+    }
+    Value offset = materializeAffineForOffsetCarrier(add.getOffset(), add,
+                                                     rewriter);
+    if (!offset)
+      continue;
+    rewriter.modifyOpInPlace(add, [&] {
+      add.getOffsetMutable().assign(offset);
+      add->setAttr(controlflow::kPointerDescriptorStructuredAxesAttr,
+                   rewriter.getDenseI32ArrayAttr(
+                       SmallVector<int32_t>(recoveredAxes.size(), 1)));
+    });
+  }
+}
+
 namespace {
 
 pointer::AnalysisOptions analysisOptions(Operation *scope) {
@@ -450,36 +525,6 @@ Value materializeCompleteOffset(OpFoldResult offset, Value anchor,
       anchor.getLoc(), cast<TypedAttr>(cast<Attribute>(offset)));
 }
 
-// A local integer producer is an exact SSA boundary, not an affine proof.
-// In particular, loop-init classifications must not describe current iter_args.
-pointer::OffsetComponents opaqueOffset(Value value, OpBuilder &builder,
-                                       pointer::ArithmeticDomain domain) {
-  pointer::OffsetComponents result;
-  result.valueType = value.getType();
-  result.domain = domain;
-  result.completeOffset = value;
-  auto type = dyn_cast<RankedTensorType>(value.getType());
-  Type elementType = type ? type.getElementType() : value.getType();
-  auto zero = builder.getZeroAttr(elementType);
-  if (type) {
-    result.shape.assign(type.getShape().begin(), type.getShape().end());
-    result.axes.assign(type.getRank(), pointer::AxisKind::Unknown);
-    result.strides.assign(type.getRank(), zero);
-    if (type.getRank() == 0) {
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointAfterValue(value);
-      result.uniformOffset =
-          builder.create<tensor::ExtractOp>(value.getLoc(), value, ValueRange{})
-              .getResult();
-    } else {
-      result.uniformOffset = zero;
-    }
-  } else {
-    result.uniformOffset = value;
-  }
-  return result;
-}
-
 bool isCommonIntegerProducer(Operation *op) {
   return isa<arith::ConstantOp, arith::AddIOp, arith::SubIOp, arith::MulIOp,
              arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
@@ -509,6 +554,7 @@ void OffsetAnalysisContext::resetPointerAnalysis() {
   publicOffsets.clear();
   analysis.clear();
   preparedOffsets.clear();
+  preparedPointers.clear();
   publicPointers.clear();
   pointerBoundaries.clear();
   offsetBoundaries.clear();
@@ -578,25 +624,21 @@ bool OffsetAnalysisContext::requiresLaneLowering(Value value) {
   return required;
 }
 
-// Parsing a later operand can normalize a local boundary and reset all public
-// entries in offsetMap. Only expose a complete set from a stable generation to
-// callers; operator[] must never silently replace a reset entry with defaults.
+// Source normalization is complete before this stable parsing phase. Parsing a
+// later operand cannot reset earlier imported facts; callers use at() to make
+// missing inputs explicit instead of silently manufacturing default states.
 void OffsetAnalysisContext::parseOperands(ValueRange values) {
-  unsigned preparedGeneration;
-  do {
-    preparedGeneration = generation;
-    for (Value value : values)
-      parse(value, value.getLoc(), *this);
-  } while (preparedGeneration != generation);
+  for (Value value : values)
+    parse(value, value.getLoc(), *this);
 }
 
 void OffsetAnalysisContext::bindLocalOffsetBoundary(Value value) {
   if (!isa<IntegerType, IndexType>(getElementTypeOrSelf(value)))
     return;
-  if (!offsetBoundaries.contains(value) &&
-      succeeded(analysis.bindOffset(
-          value, opaqueOffset(value, rewriter,
-                              pointer::ArithmeticDomain::SourceInteger))))
+  if (offsetBoundaries.contains(value))
+    return;
+  auto components = pointer::makeOpaqueOffset(value, rewriter);
+  if (succeeded(components) && succeeded(analysis.bindOffset(value, *components)))
     offsetBoundaries.insert(value);
 }
 
@@ -623,8 +665,11 @@ bool OffsetAnalysisContext::bindLocalPointerBoundary(Value value) {
   result.base = info.getPtr();
   result.elementType = ptrType.getPointeeType();
   result.addressSpace = ptrType.getAddressSpace();
-  result.offsets = opaqueOffset(info.getOffset(), rewriter,
-                                pointer::ArithmeticDomain::ElementAddress);
+  auto offsets = pointer::makeOpaqueOffset(
+      info.getOffset(), rewriter, pointer::ArithmeticDomain::ElementAddress);
+  if (failed(offsets))
+    return false;
+  result.offsets = std::move(*offsets);
   if (failed(analysis.bindPointer(value, result)))
     return false;
   pointerBoundaries.insert(value);
@@ -645,16 +690,44 @@ void OffsetAnalysisContext::prepareOffsetBoundaries(Value value) {
   bindLocalOffsetBoundary(value);
 }
 
+// Prepare the whole public pointer chain before evaluating its first node.
+// Only local boundaries need local parsing here; public parents are evaluated
+// once by the shared driver rather than eagerly imported at each chain level.
+bool OffsetAnalysisContext::preparePointerBoundaries(Value value) {
+  auto cached = preparedPointers.find(value);
+  if (cached != preparedPointers.end())
+    return cached->second;
+  Operation *op = value.getDefiningOp();
+  bool supported = op &&
+      isa<triton::AddPtrOp, triton::SplatOp, triton::BroadcastOp,
+          triton::ExpandDimsOp, arith::SelectOp>(op) &&
+      !requiresLocalAnalysis(value);
+  if (!supported) {
+    parse(value, value.getLoc(), *this);
+    bool bound = bindLocalPointerBoundary(value);
+    preparedPointers[value] = bound;
+    return bound;
+  }
+  for (Value input : op->getOperands()) {
+    if (isScalarPointer(input) || isTensorPointer(input)) {
+      if (!preparePointerBoundaries(input)) {
+        preparedPointers[value] = false;
+        return false;
+      }
+    } else {
+      prepareOffsetBoundaries(input);
+    }
+  }
+  preparedPointers[value] = true;
+  return true;
+}
+
 bool OffsetAnalysisContext::parseCommonOffset(Value value) {
   Operation *op = value.getDefiningOp();
   if (!op || !isa<IntegerType, IndexType>(getElementTypeOrSelf(value)) ||
       !isCommonIntegerProducer(op) || requiresLocalAnalysis(value))
     return false;
-  unsigned preparedGeneration;
-  do {
-    preparedGeneration = generation;
-    prepareOffsetBoundaries(value);
-  } while (preparedGeneration != generation);
+  prepareOffsetBoundaries(value);
   auto result = analysis.analyzeOffset(value);
   if (failed(result))
     return false;
@@ -679,20 +752,8 @@ bool OffsetAnalysisContext::parseCommonPointer(Value value) {
       op->hasAttr(controlflow::kPointerDescriptorOffsetFormAttr) ||
       requiresLocalAnalysis(value))
     return false;
-  unsigned preparedGeneration;
-  do {
-    preparedGeneration = generation;
-    for (Value input : op->getOperands()) {
-      if (isScalarPointer(input) || isTensorPointer(input)) {
-        parse(input, input.getLoc(), *this);
-        if (!publicPointers.contains(input) && !parseCommonPointer(input) &&
-            !bindLocalPointerBoundary(input))
-          return false;
-      } else {
-        prepareOffsetBoundaries(input);
-      }
-    }
-  } while (preparedGeneration != generation);
+  if (!preparePointerBoundaries(value))
+    return false;
   auto result = analysis.analyzePointer(value);
   if (failed(result))
     return false;
@@ -1002,9 +1063,6 @@ void parseAddPtr(triton::AddPtrOp op, const Location &loc,
   auto structuredAxes = dyn_cast_or_null<DenseI32ArrayAttr>(
       op->getAttr(controlflow::kPointerDescriptorStructuredAxesAttr));
   auto resultType = dyn_cast<RankedTensorType>(op.getType());
-  auto baseSplat = ptr.getDefiningOp<triton::SplatOp>();
-  bool hasScalarPointerSplatBase =
-      baseSplat && isa<triton::PointerType>(baseSplat.getSrc().getType());
   SmallVector<PtrOffsetInfo::AxisInfo> descriptorAxes;
   if (structuredAxes) {
     if (!isRebuild || !resultType ||
@@ -1060,11 +1118,6 @@ void parseAddPtr(triton::AddPtrOp op, const Location &loc,
   bool isCompleteOffsetCarrier = isRebuild && !isStridedRankOne;
   bool isDescriptorOwned =
       isRebuild || ptrOffsetInfo.isPointerDescriptorOwned();
-  bool descriptorIsOpaque =
-      !descriptorAxes.empty() &&
-      llvm::all_of(descriptorAxes, [](PtrOffsetInfo::AxisInfo axis) {
-        return axis == PtrOffsetInfo::AxisInfo::unstructured;
-      });
 
   if (isCompleteOffsetCarrier) {
     // The carrier is complete relative to the descriptor base, but parsing
@@ -1084,30 +1137,6 @@ void parseAddPtr(triton::AddPtrOp op, const Location &loc,
     if (offsetElementType.getWidth() > 64) {
       op.emitOpError("complete-offset carrier wider than i64 is unsupported");
       return;
-    }
-
-    SmallVector<PtrOffsetInfo::AxisInfo> recoveredAxes;
-    Value materializedOffset;
-    if (descriptorIsOpaque && hasScalarPointerSplatBase) {
-      parse(offsetValue, op.getLoc(), context);
-      auto carrierInfo = offsetMap.find(offsetValue);
-      if (carrierInfo != offsetMap.end() &&
-          getRecoverableCarrierAxes(carrierInfo->second, resultType.getRank(),
-                                    recoveredAxes)) {
-        materializedOffset =
-            materializeAffineForOffsetCarrier(offsetValue, op, rewriter);
-        if (!materializedOffset)
-          recoveredAxes.clear();
-      }
-    }
-
-    if (materializedOffset) {
-      offsetValue = materializedOffset;
-      context.resetPointerAnalysis();
-      op->setOperand(1, offsetValue);
-      SmallVector<int32_t> structuredAxes(recoveredAxes.size(), 1);
-      op->setAttr(controlflow::kPointerDescriptorStructuredAxesAttr,
-                  rewriter.getDenseI32ArrayAttr(structuredAxes));
     }
 
     RewriterBase::InsertionGuard guard(rewriter);
@@ -1136,9 +1165,7 @@ void parseAddPtr(triton::AddPtrOp op, const Location &loc,
     // is no proof that all lanes address the same element. Keep this state
     // conservative and force the lane-wise memory-access path.
     ptrOffsetInfo.setScalarLike(false);
-    if (!recoveredAxes.empty())
-      ptrOffsetInfo.setStructured(recoveredAxes);
-    else if (!descriptorAxes.empty())
+    if (!descriptorAxes.empty())
       ptrOffsetInfo.setStructured(descriptorAxes);
     else
       ptrOffsetInfo.setUnstructured(resultType.getRank());
@@ -1435,7 +1462,7 @@ void parseReshape(triton::ReshapeOp op, const Location &loc,
   parse(op.getSrc(), op.getLoc(), context);
   PtrOffsetInfo info = offsetMap.at(op.getSrc());
   if (!info.getPtr() || !isScalarPointer(info.getPtr()) ||
-      (op.getAllowReorder() && dstType.getEncoding())) {
+      op.getAllowReorder()) {
     // Without a common scalar base (or a fixed lane mapping), keep the
     // actual result pointers. Never choose one lane's base for every lane.
     recordOpaqueTensorPointer(dst, offsetMap);
@@ -1444,12 +1471,6 @@ void parseReshape(triton::ReshapeOp op, const Location &loc,
 
   RewriterBase::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(op);
-  if (op.getAllowReorder()) {
-    // Choose the order-preserving realization permitted by allow_reorder.
-    // Remaining pointer users and the derived offset must share this mapping.
-    context.resetPointerAnalysis();
-    rewriter.modifyOpInPlace(op, [&] { op->removeAttr("allow_reorder"); });
-  }
   auto offsetType = cast<RankedTensorType>(info.getOffset().getType());
   auto reshapedOffsetType = RankedTensorType::get(
       dstType.getShape(), offsetType.getElementType(), dstType.getEncoding());

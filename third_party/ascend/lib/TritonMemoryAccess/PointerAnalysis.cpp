@@ -32,6 +32,70 @@
 #include "llvm/ADT/DenseSet.h"
 
 namespace mlir::triton::pointer {
+
+bool OffsetComponents::hasAffineForm() const {
+  return valueType && completeOffset && uniformOffset &&
+         axes.size() == shape.size() && strides.size() == shape.size() &&
+         llvm::none_of(axes, [](AxisKind axis) {
+           return axis == AxisKind::Unknown;
+         });
+}
+
+bool OffsetComponents::isUniform() const {
+  return hasAffineForm() && llvm::all_of(axes, [](AxisKind axis) {
+           return axis == AxisKind::Invariant;
+         });
+}
+
+std::optional<OpFoldResult>
+OffsetComponents::getKnownStride(unsigned axis) const {
+  if (!valueType || axis >= shape.size() || axis >= axes.size() ||
+      axis >= strides.size() || !strides[axis] ||
+      axes[axis] == AxisKind::Unknown)
+    return std::nullopt;
+  return strides[axis];
+}
+
+std::optional<OpFoldResult> OffsetComponents::getAffineOrigin() const {
+  return hasAffineForm() ? std::optional<OpFoldResult>(uniformOffset)
+                         : std::nullopt;
+}
+
+FailureOr<OffsetComponents> makeOpaqueOffset(Value value, OpBuilder &builder,
+                                            ArithmeticDomain domain) {
+  if (!value || (!isa<IntegerType, IndexType>(value.getType()) &&
+                 !isa<RankedTensorType>(value.getType())))
+    return failure();
+  Type element = detail::getIntegerElementType(value.getType());
+  if ((!element.isSignlessInteger() && !element.isIndex()) ||
+      (domain == ArithmeticDomain::ElementAddress &&
+       !element.isSignlessInteger(64)))
+    return failure();
+  OffsetComponents result;
+  result.valueType = value.getType();
+  result.domain = domain;
+  result.shape = detail::getLogicalShape(value.getType());
+  result.completeOffset = value;
+  result.axes.assign(result.shape.size(), AxisKind::Unknown);
+  result.strides.assign(result.shape.size(), builder.getZeroAttr(element));
+  if (!isa<RankedTensorType>(value.getType())) {
+    result.uniformOffset = value;
+  } else if (result.shape.empty()) {
+    if (auto splat = value.getDefiningOp<triton::SplatOp>()) {
+      result.uniformOffset = splat.getSrc();
+    } else {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointAfterValue(value);
+      result.uniformOffset =
+          builder.create<tensor::ExtractOp>(value.getLoc(), value, ValueRange{})
+              .getResult();
+    }
+  } else {
+    result.uniformOffset = builder.getZeroAttr(element);
+  }
+  return result;
+}
+
 namespace {
 
 bool validOfrType(OpFoldResult value, Type expected) {

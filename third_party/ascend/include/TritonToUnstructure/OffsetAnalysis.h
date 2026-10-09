@@ -149,8 +149,14 @@ private:
   SmallVector<AxisInfo> structured;
 };
 
+/// Normalize pointer reshapes and CFO offset carriers before creating a stable
+/// parsing context. This may change existing operands/attributes; parse() only
+/// builds numeric helpers and facts. Do not keep caches across this function.
+void normalizePointerAnalysisInputs(Operation *scope, RewriterBase &rewriter);
+
 /// One stable parsing phase. Local boundaries are prepared before public
-/// recursion; no analysis state survives source replacement or greedy rewrites.
+/// recursion. The caller resets after source replacement and ends the context
+/// before greedy rewrites; parsing itself never changes existing source ops.
 class OffsetAnalysisContext {
 public:
   OffsetAnalysisContext(RewriterBase &rewriter,
@@ -174,7 +180,9 @@ private:
   llvm::DenseMap<Value, bool> laneLoweringPolicy;
   bool requiresLaneLowering(Value value);
   void prepareOffsetBoundaries(Value value);
+  bool preparePointerBoundaries(Value value);
   llvm::DenseSet<Value> preparedOffsets;
+  llvm::DenseMap<Value, bool> preparedPointers;
   pointer::PointerAnalysis analysis;
   llvm::DenseSet<Value> pointerBoundaries;
   llvm::DenseSet<Value> offsetBoundaries;
