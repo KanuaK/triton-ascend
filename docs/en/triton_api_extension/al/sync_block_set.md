@@ -1,5 +1,7 @@
 # al.sync_block_set API Documentation
 
+When using this Ascend affinity API, set `disable_auto_inject_block_sync=True` in `triton.Config` kwargs or kernel launch meta-parameters to disable automatic inter-core synchronization insertion and manage synchronization explicitly. See the [compiler option reference](../../environment_variable_and_compiler_options_reference.md#compiler-options-reference).
+
 ## 1. Hardware Background
 
 An inter-core synchronization control interface for split-mode execution.
