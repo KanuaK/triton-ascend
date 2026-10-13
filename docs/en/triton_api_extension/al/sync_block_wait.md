@@ -1,7 +1,5 @@
 # al.sync_block_wait API Documentation
 
-When using this Ascend affinity API, set `disable_auto_inject_block_sync=True` in `triton.Config` kwargs or kernel launch meta-parameters to disable automatic inter-core synchronization insertion and manage synchronization explicitly. See the [compiler option reference](../../environment_variable_and_compiler_options_reference.md#compiler-options-reference).
-
 ## 1. Hardware Background
 
 An inter-core synchronization control interface for split-mode execution.
@@ -15,6 +13,8 @@ This interface is used together with `sync_block_set`. When used, an inter-core 
     <td>Python<br>def sync_block_wait(sender, receiver, event_id, sender_pipe: PIPE, receiver_pipe: PIPE, _builder=None):<br><br>class PIPE(enum.Enum):<br>    PIPE_S = ascend_ir.PIPE.PIPE_S<br>    PIPE_V = ascend_ir.PIPE.PIPE_V<br>    PIPE_M = ascend_ir.PIPE.PIPE_M<br>    PIPE_MTE1 = ascend_ir.PIPE.PIPE_MTE1<br>    PIPE_MTE2 = ascend_ir.PIPE.PIPE_MTE2<br>    PIPE_MTE3 = ascend_ir.PIPE.PIPE_MTE3<br>    PIPE_ALL = ascend_ir.PIPE.PIPE_ALL<br>    PIPE_FIX = ascend_ir.PIPE.PIPE_FIX</td>
   </tr>
 </table>
+
+When using this Ascend affinity API, set `disable_auto_inject_block_sync=True` in `triton.Config` kwargs or kernel launch meta-parameters to disable automatic inter-core synchronization insertion and manage synchronization explicitly. See the [compiler option reference](../../environment_variable_and_compiler_options_reference.md#compiler-options-reference).
 
 ### Return Value
 
