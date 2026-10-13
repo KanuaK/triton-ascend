@@ -185,7 +185,7 @@ Remove the following options from kernel launch arguments and `triton.Config`; t
 | `arch` | The target architecture is provided by the compilation target's `GPUTarget.arch`. |
 | `auto_blockify_size` | No replacement. |
 | `auto_tile_and_bind_subblock` | The compiler determines tiling and sub-block binding automatically. |
-| `bisheng_options` | User values are ignored; the backend manages BiSheng compiler arguments and libdevice linkage. |
+| `bisheng_options` | User values are ignored. |
 | `code_motion` | No replacement. |
 | `compile_on_910_95` | The target product is detected from the compilation target. |
 | `enable_auto_blockify` | The compiler manages automatic block mapping and its safety analysis. |

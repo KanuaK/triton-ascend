@@ -185,7 +185,7 @@ triton.Config({"multibuffer_mode": {"gm": 1, "l1": 2, "l0c": 1, "ub": 1}})
 | `arch` | 目标架构由编译目标的 `GPUTarget.arch` 提供。 |
 | `auto_blockify_size` | 无替代项。 |
 | `auto_tile_and_bind_subblock` | 切分与 sub-block 绑定由编译器自动决定。 |
-| `bisheng_options` | 用户值被忽略；毕昇编译参数和 libdevice 链接由后端管理。 |
+| `bisheng_options` | 用户值被忽略。 |
 | `code_motion` | 无替代项。 |
 | `compile_on_910_95` | 目标产品由编译目标自动识别。 |
 | `enable_auto_blockify` | 自动 block 映射及安全分析由编译器管理。 |
