@@ -42,7 +42,6 @@ public:
   using Result = BlockResult;
   explicit BlockPointerRules(AnalysisOptions options) : basic(options) {}
 
-  std::optional<Result> resolveBoundary(AnalysisRequest request) const;
   FailureOr<SmallVector<AnalysisRequest>>
   collectInputs(AnalysisRequest request) const;
   FailureOr<Result> transfer(AnalysisRequest request, ArrayRef<Result> inputs,

@@ -53,16 +53,6 @@ struct ExtraRules {
   using Result = ExtraResult;
   pointer_detail::BasicPointerRules basic{AnalysisOptions{}};
 
-  std::optional<Result>
-  resolveBoundary(pointer_detail::AnalysisRequest request) const {
-    auto base = basic.resolveBoundary(request);
-    if (!base)
-      return std::nullopt;
-    Result result;
-    result.basic = *base;
-    return result;
-  }
-
   FailureOr<SmallVector<pointer_detail::AnalysisRequest>>
   collectInputs(pointer_detail::AnalysisRequest request) const {
     if (request.kind == pointer_detail::FirstExtensionRequest) {
