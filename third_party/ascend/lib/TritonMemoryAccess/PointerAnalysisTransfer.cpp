@@ -61,8 +61,8 @@ OpFoldResult integerAttr(Type type, const llvm::APInt &value,
   return scalarIntegerAttr(type, value, builder);
 }
 
-FailureOr<OffsetComponents> invariantOffset(Value value, OpFoldResult scalar,
-                                            OpBuilder &builder) {
+OffsetComponents invariantOffset(Value value, OpFoldResult scalar,
+                                 OpBuilder &builder) {
   OffsetComponents result;
   result.valueType = value.getType();
   result.shape = getLogicalShape(value.getType());
@@ -73,16 +73,6 @@ FailureOr<OffsetComponents> invariantOffset(Value value, OpFoldResult scalar,
   result.strides.assign(result.shape.size(),
                         builder.getIntegerAttr(element, 0));
   return result;
-}
-
-bool sameShape(Type left, Type right) {
-  if (left == right)
-    return true;
-  auto l = dyn_cast<RankedTensorType>(left);
-  auto r = dyn_cast<RankedTensorType>(right);
-  return l && r && l.getShape() == r.getShape() &&
-         l.getEncoding() == r.getEncoding() &&
-         l.getElementType() == r.getElementType();
 }
 
 FailureOr<OpFoldResult> combine(BinaryKind kind, OpFoldResult lhs,
@@ -97,7 +87,7 @@ FailureOr<OffsetComponents>
 combineOffsets(Value complete, const OffsetComponents &lhs,
                const OffsetComponents &rhs, BinaryKind kind,
                AnalysisOptions options, OpBuilder &builder) {
-  if (!sameShape(lhs.valueType, rhs.valueType) || lhs.domain != rhs.domain ||
+  if (lhs.valueType != rhs.valueType || lhs.domain != rhs.domain ||
       lhs.shape != rhs.shape)
     return failure();
   Type scalar = getIntegerElementType(complete.getType());
@@ -333,11 +323,6 @@ FailureOr<PointerComponents> addPointerOffsets(Value resultValue,
 
 } // namespace
 
-std::optional<BasicPointerRules::Result>
-BasicPointerRules::resolveBoundary(AnalysisRequest) const {
-  return std::nullopt;
-}
-
 FailureOr<SmallVector<AnalysisRequest>>
 BasicPointerRules::collectInputs(AnalysisRequest request) const {
   if (request.kind != SourceInteger && !supportsAddressAnalysis(options))
@@ -397,258 +382,258 @@ BasicPointerRules::collectInputs(AnalysisRequest request) const {
   return result;
 }
 
-FailureOr<BasicPointerRules::Result>
-BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
-                            OpBuilder &builder) const {
-  Value value = request.value;
-  if (request.kind == AddressDelta) {
+namespace {
+
+FailureOr<BasicResult>
+transferAddressDelta(Value value, ArrayRef<BasicResult> inputs,
+                     AnalysisOptions options, OpBuilder &builder) {
+  if (inputs.size() != 1)
+    return failure();
+  FailureOr<OffsetComponents> projected =
+      projectAddress(value, inputs.front(), options, builder);
+  if (failed(projected))
+    return failure();
+  BasicResult result;
+  result.offset = std::move(*projected);
+  const auto &range = *inputs.front().integerRange;
+  result.integerRange = range.getBitWidth() < 64 ? range.signExtend(64) : range;
+  return result;
+}
+
+FailureOr<BasicResult>
+transferSourceInteger(Value value, ArrayRef<BasicResult> inputs,
+                      AnalysisOptions options, OpBuilder &builder) {
+  // Extensions may omit the basic view. Reject it before using any source
+  // operand; shape operations need the range just as arithmetic operations do.
+  for (const BasicResult &input : inputs)
+    if (!input.offset || !input.integerRange)
+      return failure();
+  FailureOr<unsigned> width = getIntegerWidth(value.getType(), options);
+  if (failed(width))
+    return failure();
+  Type scalar = getIntegerElementType(value.getType());
+  auto opaque = makeOpaqueOffset(value, builder);
+  if (failed(opaque))
+    return failure();
+  OffsetComponents state = std::move(*opaque);
+  llvm::ConstantRange range = getValueRange(value, *width);
+  if (auto makeRange = value.getDefiningOp<triton::MakeRangeOp>()) {
+    if (state.shape.size() != 1 || state.shape[0] <= 0 || *width != 32)
+      return failure();
+    int64_t start = makeRange.getStartAttr().getInt();
+    int64_t end = makeRange.getEndAttr().getInt();
+    if (end <= start || end - start != state.shape[0])
+      return failure();
+    state.axes = {AxisKind::Structured};
+    state.uniformOffset =
+        integerAttr(scalar, llvm::APInt(32, start), builder);
+    state.strides = {integerAttr(scalar, llvm::APInt(32, 1), builder)};
+    range = llvm::ConstantRange(llvm::APInt(32, start), llvm::APInt(32, end));
+  } else if (FailureOr<llvm::APInt> constant =
+                 getIntegerConstant(value, *width);
+             succeeded(constant)) {
+    state = invariantOffset(value, integerAttr(scalar, *constant, builder),
+                            builder);
+  } else if (auto select = value.getDefiningOp<arith::SelectOp>()) {
+    if (inputs.size() != 2)
+      return failure();
+    const auto &left = *inputs[0].offset;
+    const auto &right = *inputs[1].offset;
+    range = inputs[0].integerRange->unionWith(*inputs[1].integerRange);
+    if (select.getTrueValue() == select.getFalseValue()) {
+      state = left;
+      state.completeOffset = value;
+    } else if (select.getCondition().getType().isInteger(1) &&
+               left.valueType == right.valueType &&
+               left.hasAffineForm() && right.hasAffineForm()) {
+      auto choose = [&](OpFoldResult lhs,
+                        OpFoldResult rhs) -> FailureOr<OpFoldResult> {
+        if (lhs == rhs)
+          return lhs;
+        auto l = materialize(lhs, scalar, builder, value.getLoc());
+        auto r = materialize(rhs, scalar, builder, value.getLoc());
+        if (failed(l) || failed(r))
+          return failure();
+        return OpFoldResult(
+            builder
+                .create<arith::SelectOp>(value.getLoc(),
+                                         select.getCondition(), *l, *r)
+                .getResult());
+      };
+      auto uniform = choose(left.uniformOffset, right.uniformOffset);
+      if (failed(uniform))
+        return failure();
+      state.uniformOffset = *uniform;
+      for (unsigned axis = 0; axis < state.shape.size(); ++axis) {
+        auto stride = choose(left.strides[axis], right.strides[axis]);
+        if (failed(stride))
+          return failure();
+        state.strides[axis] = *stride;
+        state.axes[axis] = left.axes[axis] == AxisKind::Invariant &&
+                                   right.axes[axis] == AxisKind::Invariant
+                               ? AxisKind::Invariant
+                               : AxisKind::Structured;
+      }
+    }
+  } else if (auto splat = value.getDefiningOp<triton::SplatOp>()) {
+    if (inputs.size() != 1 ||
+        isa<RankedTensorType>(inputs.front().offset->valueType))
+      return failure();
+    state = invariantOffset(value, inputs.front().offset->uniformOffset,
+                            builder);
+    range = *inputs.front().integerRange;
+  } else if (auto broadcast = value.getDefiningOp<triton::BroadcastOp>()) {
     if (inputs.size() != 1)
       return failure();
-    FailureOr<OffsetComponents> projected =
-        projectAddress(value, inputs.front(), options, builder);
-    if (failed(projected))
+    const auto &src = *inputs.front().offset;
+    if (src.shape.size() != state.shape.size())
       return failure();
-    Result result;
-    result.offset = std::move(*projected);
-    if (inputs.front().integerRange) {
-      unsigned width = inputs.front().integerRange->getBitWidth();
-      result.integerRange = width < 64
-                                ? inputs.front().integerRange->signExtend(64)
-                                : *inputs.front().integerRange;
-    }
-    return result;
-  }
-  if (request.kind == SourceInteger) {
-    // Extensions may omit the basic view. Reject it before using any source
-    // operand; shape operations need the range just as arithmetic operations do.
-    for (const BasicResult &input : inputs)
-      if (!input.offset || !input.integerRange)
-        return failure();
-    FailureOr<unsigned> width = getIntegerWidth(value.getType(), options);
-    if (failed(width))
-      return failure();
-    Type scalar = getIntegerElementType(value.getType());
-    auto opaque = makeOpaqueOffset(value, builder);
-    if (failed(opaque))
-      return failure();
-    OffsetComponents state = std::move(*opaque);
-    llvm::ConstantRange range = getValueRange(value, *width);
-    if (auto makeRange = value.getDefiningOp<triton::MakeRangeOp>()) {
-      if (state.shape.size() != 1 || state.shape[0] <= 0 || *width != 32)
-        return failure();
-      int64_t start = makeRange.getStartAttr().getInt();
-      int64_t end = makeRange.getEndAttr().getInt();
-      if (end <= start || end - start != state.shape[0])
-        return failure();
-      state.axes = {AxisKind::Structured};
-      state.uniformOffset =
-          integerAttr(scalar, llvm::APInt(32, start), builder);
-      state.strides = {integerAttr(scalar, llvm::APInt(32, 1), builder)};
-      range = llvm::ConstantRange(llvm::APInt(32, start), llvm::APInt(32, end));
-    } else if (FailureOr<llvm::APInt> constant =
-                   getIntegerConstant(value, *width);
-               succeeded(constant)) {
-      state = *invariantOffset(value, integerAttr(scalar, *constant, builder),
-                               builder);
-    } else if (auto select = value.getDefiningOp<arith::SelectOp>()) {
-      if (inputs.size() != 2)
-        return failure();
-      const auto &left = *inputs[0].offset;
-      const auto &right = *inputs[1].offset;
-      range = inputs[0].integerRange->unionWith(*inputs[1].integerRange);
-      if (select.getTrueValue() == select.getFalseValue()) {
-        state = left;
-        state.completeOffset = value;
-      } else if (select.getCondition().getType().isInteger(1) &&
-                 sameShape(left.valueType, right.valueType) &&
-                 left.hasAffineForm() && right.hasAffineForm()) {
-        auto choose = [&](OpFoldResult lhs,
-                          OpFoldResult rhs) -> FailureOr<OpFoldResult> {
-          if (lhs == rhs)
-            return lhs;
-          auto l = materialize(lhs, scalar, builder, value.getLoc());
-          auto r = materialize(rhs, scalar, builder, value.getLoc());
-          if (failed(l) || failed(r))
-            return failure();
-          return OpFoldResult(
-              builder
-                  .create<arith::SelectOp>(value.getLoc(),
-                                           select.getCondition(), *l, *r)
-                  .getResult());
-        };
-        auto uniform = choose(left.uniformOffset, right.uniformOffset);
-        if (failed(uniform))
+    state.axes = src.axes;
+    state.strides = src.strides;
+    for (unsigned axis = 0; axis < state.shape.size(); ++axis) {
+      if (src.shape[axis] != state.shape[axis]) {
+        if (src.shape[axis] != 1)
           return failure();
-        state.uniformOffset = *uniform;
-        for (unsigned axis = 0; axis < state.shape.size(); ++axis) {
-          auto stride = choose(left.strides[axis], right.strides[axis]);
-          if (failed(stride))
-            return failure();
-          state.strides[axis] = *stride;
-          state.axes[axis] = left.axes[axis] == AxisKind::Invariant &&
-                                     right.axes[axis] == AxisKind::Invariant
-                                 ? AxisKind::Invariant
-                                 : AxisKind::Structured;
-        }
+        // A one-element opaque tensor is constant along this dimension,
+        // but its scalar value is not known. Keep the Unknown carrier.
+        if (src.axes[axis] != AxisKind::Unknown)
+          state.axes[axis] = AxisKind::Invariant;
+        state.strides[axis] = builder.getIntegerAttr(scalar, 0);
       }
-    } else if (auto splat = value.getDefiningOp<triton::SplatOp>()) {
-      if (inputs.size() != 1 ||
-          isa<RankedTensorType>(inputs.front().offset->valueType))
-        return failure();
-      state = *invariantOffset(value, inputs.front().offset->uniformOffset,
-                               builder);
-      range = *inputs.front().integerRange;
-    } else if (auto broadcast = value.getDefiningOp<triton::BroadcastOp>()) {
-      if (inputs.size() != 1)
-        return failure();
-      const auto &src = *inputs.front().offset;
-      if (src.shape.size() != state.shape.size())
-        return failure();
-      state.axes = src.axes;
-      state.strides = src.strides;
-      for (unsigned axis = 0; axis < state.shape.size(); ++axis) {
-        if (src.shape[axis] != state.shape[axis]) {
-          if (src.shape[axis] != 1)
-            return failure();
-          // A one-element opaque tensor is constant along this dimension,
-          // but its scalar value is not known. Keep the Unknown carrier.
-          if (src.axes[axis] != AxisKind::Unknown)
-            state.axes[axis] = AxisKind::Invariant;
-          state.strides[axis] = builder.getIntegerAttr(scalar, 0);
-        }
-      }
-      if (state.hasAffineForm())
-        state.uniformOffset = src.uniformOffset;
-      range = *inputs.front().integerRange;
-    } else if (auto expand = value.getDefiningOp<triton::ExpandDimsOp>()) {
-      if (inputs.size() != 1)
-        return failure();
-      const auto &src = *inputs.front().offset;
-      unsigned axis = expand.getAxis();
-      if (axis > src.shape.size() || state.shape.size() != src.shape.size() + 1)
-        return failure();
-      state.axes = src.axes;
-      state.axes.insert(state.axes.begin() + axis, AxisKind::Invariant);
-      state.strides = src.strides;
-      state.strides.insert(state.strides.begin() + axis,
-                           builder.getIntegerAttr(scalar, 0));
-      if (state.hasAffineForm())
-        state.uniformOffset = src.uniformOffset;
-      range = *inputs.front().integerRange;
-    } else if (value.getDefiningOp<arith::AddIOp>() ||
-               value.getDefiningOp<arith::SubIOp>()) {
-      if (inputs.size() != 2)
-        return failure();
-      BinaryKind kind = value.getDefiningOp<arith::AddIOp>()
-                            ? BinaryKind::Add
-                            : BinaryKind::Subtract;
-      FailureOr<OffsetComponents> joined = combineOffsets(
-          value, *inputs[0].offset, *inputs[1].offset, kind, options, builder);
-      if (failed(joined))
-        return failure();
-      state = std::move(*joined);
-      range = kind == BinaryKind::Add
-                  ? inputs[0].integerRange->add(*inputs[1].integerRange)
-                  : inputs[0].integerRange->sub(*inputs[1].integerRange);
-    } else if (value.getDefiningOp<arith::MulIOp>()) {
-      if (inputs.size() != 2)
-        return failure();
-      const OffsetComponents &left = *inputs[0].offset;
-      const OffsetComponents &right = *inputs[1].offset;
-      if (left.shape != right.shape ||
-          !sameShape(left.valueType, right.valueType))
-        return failure();
-      bool leftUniform = left.isUniform();
-      bool rightUniform = right.isUniform();
-      if (leftUniform || rightUniform) {
-        const auto &varying = leftUniform ? right : left;
-        const auto &scale = leftUniform ? left : right;
-        state.axes = varying.axes;
-        state.strides.clear();
-        for (unsigned axis = 0; axis < state.shape.size(); ++axis) {
-          if (state.axes[axis] == AxisKind::Unknown) {
-            state.strides.push_back(builder.getIntegerAttr(scalar, 0));
-            continue;
-          }
-          FailureOr<OpFoldResult> stride = combine(
-              BinaryKind::Multiply, varying.strides[axis], scale.uniformOffset,
-              scalar, options, builder, value.getLoc());
-          if (failed(stride))
-            return failure();
-          state.strides.push_back(*stride);
-        }
-        if (state.hasAffineForm()) {
-          FailureOr<OpFoldResult> uniform = combine(
-              BinaryKind::Multiply, varying.uniformOffset, scale.uniformOffset,
-              scalar, options, builder, value.getLoc());
-          if (failed(uniform))
-            return failure();
-          state.uniformOffset = *uniform;
-        }
-      }
-      range = inputs[0].integerRange->multiply(*inputs[1].integerRange);
-    } else if (value.getDefiningOp<arith::ExtSIOp>() ||
-               value.getDefiningOp<arith::ExtUIOp>() ||
-               value.getDefiningOp<arith::TruncIOp>() ||
-               value.getDefiningOp<arith::IndexCastOp>() ||
-               value.getDefiningOp<arith::IndexCastUIOp>()) {
-      if (inputs.size() != 1)
-        return failure();
-      const auto &src = *inputs[0].offset;
-      unsigned sourceWidth = inputs[0].integerRange->getBitWidth();
-      bool unsignedCast = value.getDefiningOp<arith::ExtUIOp>() ||
-                          value.getDefiningOp<arith::IndexCastUIOp>();
-      bool narrowing = *width < sourceWidth;
-      bool safeLift =
-          narrowing || *width == sourceWidth ||
-          (affineFitsSigned(src, sourceWidth) &&
-           (!unsignedCast || inputs[0].integerRange->isAllNonNegative()));
-      state.axes.clear();
+    }
+    if (state.hasAffineForm())
+      state.uniformOffset = src.uniformOffset;
+    range = *inputs.front().integerRange;
+  } else if (auto expand = value.getDefiningOp<triton::ExpandDimsOp>()) {
+    if (inputs.size() != 1)
+      return failure();
+    const auto &src = *inputs.front().offset;
+    unsigned axis = expand.getAxis();
+    if (axis > src.shape.size() || state.shape.size() != src.shape.size() + 1)
+      return failure();
+    state.axes = src.axes;
+    state.axes.insert(state.axes.begin() + axis, AxisKind::Invariant);
+    state.strides = src.strides;
+    state.strides.insert(state.strides.begin() + axis,
+                         builder.getIntegerAttr(scalar, 0));
+    if (state.hasAffineForm())
+      state.uniformOffset = src.uniformOffset;
+    range = *inputs.front().integerRange;
+  } else if (value.getDefiningOp<arith::AddIOp>() ||
+             value.getDefiningOp<arith::SubIOp>()) {
+    if (inputs.size() != 2)
+      return failure();
+    BinaryKind kind = value.getDefiningOp<arith::AddIOp>()
+                          ? BinaryKind::Add
+                          : BinaryKind::Subtract;
+    FailureOr<OffsetComponents> joined = combineOffsets(
+        value, *inputs[0].offset, *inputs[1].offset, kind, options, builder);
+    if (failed(joined))
+      return failure();
+    state = std::move(*joined);
+    range = kind == BinaryKind::Add
+                ? inputs[0].integerRange->add(*inputs[1].integerRange)
+                : inputs[0].integerRange->sub(*inputs[1].integerRange);
+  } else if (value.getDefiningOp<arith::MulIOp>()) {
+    if (inputs.size() != 2)
+      return failure();
+    const OffsetComponents &left = *inputs[0].offset;
+    const OffsetComponents &right = *inputs[1].offset;
+    if (left.shape != right.shape || left.valueType != right.valueType)
+      return failure();
+    bool leftUniform = left.isUniform();
+    bool rightUniform = right.isUniform();
+    if (leftUniform || rightUniform) {
+      const auto &varying = leftUniform ? right : left;
+      const auto &scale = leftUniform ? left : right;
+      state.axes = varying.axes;
       state.strides.clear();
-      for (unsigned axis = 0; axis < src.shape.size(); ++axis) {
-        AxisKind candidate = src.axes[axis];
-        if (candidate == AxisKind::Structured && !safeLift)
-          candidate = AxisKind::Unknown;
-        state.axes.push_back(candidate);
-        if (candidate != AxisKind::Structured) {
+      for (unsigned axis = 0; axis < state.shape.size(); ++axis) {
+        if (state.axes[axis] == AxisKind::Unknown) {
           state.strides.push_back(builder.getIntegerAttr(scalar, 0));
           continue;
         }
-        // A proven nonnegative affine value can still have a negative stride
-        // (e.g. 3 - range). Extend the coefficient as signed, not as extui.
-        FailureOr<OpFoldResult> converted =
-            foldOrCreateCast(src.strides[axis], scalar, CastKind::Signed,
-                             options, builder, value.getLoc());
-        if (failed(converted))
+        FailureOr<OpFoldResult> stride = combine(
+            BinaryKind::Multiply, varying.strides[axis], scale.uniformOffset,
+            scalar, options, builder, value.getLoc());
+        if (failed(stride))
           return failure();
-        state.strides.push_back(*converted);
+        state.strides.push_back(*stride);
       }
       if (state.hasAffineForm()) {
-        FailureOr<OpFoldResult> converted = foldOrCreateCast(
-            src.uniformOffset, scalar,
-            unsignedCast ? CastKind::Unsigned : CastKind::Signed, options,
-            builder, value.getLoc());
-        if (failed(converted))
+        FailureOr<OpFoldResult> uniform = combine(
+            BinaryKind::Multiply, varying.uniformOffset, scale.uniformOffset,
+            scalar, options, builder, value.getLoc());
+        if (failed(uniform))
           return failure();
-        state.uniformOffset = *converted;
+        state.uniformOffset = *uniform;
       }
-      if (*width < sourceWidth)
-        range = inputs[0].integerRange->truncate(*width);
-      else if (*width == sourceWidth)
-        range = *inputs[0].integerRange;
-      else if (unsignedCast)
-        range = inputs[0].integerRange->zeroExtend(*width);
-      else
-        range = inputs[0].integerRange->signExtend(*width);
     }
-    Result result;
-    result.offset = std::move(state);
-    result.integerRange = std::move(range);
-    return result;
+    range = inputs[0].integerRange->multiply(*inputs[1].integerRange);
+  } else if (value.getDefiningOp<arith::ExtSIOp>() ||
+             value.getDefiningOp<arith::ExtUIOp>() ||
+             value.getDefiningOp<arith::TruncIOp>() ||
+             value.getDefiningOp<arith::IndexCastOp>() ||
+             value.getDefiningOp<arith::IndexCastUIOp>()) {
+    if (inputs.size() != 1)
+      return failure();
+    const auto &src = *inputs[0].offset;
+    unsigned sourceWidth = inputs[0].integerRange->getBitWidth();
+    bool unsignedCast = value.getDefiningOp<arith::ExtUIOp>() ||
+                        value.getDefiningOp<arith::IndexCastUIOp>();
+    bool narrowing = *width < sourceWidth;
+    bool safeLift =
+        narrowing || *width == sourceWidth ||
+        (affineFitsSigned(src, sourceWidth) &&
+         (!unsignedCast || inputs[0].integerRange->isAllNonNegative()));
+    state.axes.clear();
+    state.strides.clear();
+    for (unsigned axis = 0; axis < src.shape.size(); ++axis) {
+      AxisKind candidate = src.axes[axis];
+      if (candidate == AxisKind::Structured && !safeLift)
+        candidate = AxisKind::Unknown;
+      state.axes.push_back(candidate);
+      if (candidate != AxisKind::Structured) {
+        state.strides.push_back(builder.getIntegerAttr(scalar, 0));
+        continue;
+      }
+      // A proven nonnegative affine value can still have a negative stride
+      // (e.g. 3 - range). Extend the coefficient as signed, not as extui.
+      FailureOr<OpFoldResult> converted =
+          foldOrCreateCast(src.strides[axis], scalar, CastKind::Signed,
+                           options, builder, value.getLoc());
+      if (failed(converted))
+        return failure();
+      state.strides.push_back(*converted);
+    }
+    if (state.hasAffineForm()) {
+      FailureOr<OpFoldResult> converted = foldOrCreateCast(
+          src.uniformOffset, scalar,
+          unsignedCast ? CastKind::Unsigned : CastKind::Signed, options,
+          builder, value.getLoc());
+      if (failed(converted))
+        return failure();
+      state.uniformOffset = *converted;
+    }
+    if (*width < sourceWidth)
+      range = inputs[0].integerRange->truncate(*width);
+    else if (*width == sourceWidth)
+      range = *inputs[0].integerRange;
+    else if (unsignedCast)
+      range = inputs[0].integerRange->zeroExtend(*width);
+    else
+      range = inputs[0].integerRange->signExtend(*width);
   }
+  BasicResult result;
+  result.offset = std::move(state);
+  result.integerRange = std::move(range);
+  return result;
+}
 
-  if (request.kind != OrdinaryPointer ||
-      !isOrdinaryPointerType(value.getType()))
+FailureOr<BasicResult>
+transferOrdinaryPointer(Value value, ArrayRef<BasicResult> inputs,
+                        AnalysisOptions options, OpBuilder &builder) {
+  if (!isOrdinaryPointerType(value.getType()))
     return failure();
   Type pointerElement = getIntegerElementType(value.getType());
   auto pointerType = cast<triton::PointerType>(pointerElement);
@@ -659,7 +644,7 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
         value, *inputs[0].pointer, *inputs[1].offset, options, builder);
     if (failed(updated))
       return failure();
-    Result result;
+    BasicResult result;
     result.pointer = std::move(*updated);
     return result;
   }
@@ -681,7 +666,7 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
     result.offsets.axes.assign(tensor.getRank(), AxisKind::Invariant);
     result.offsets.strides.assign(tensor.getRank(),
                                   builder.getI64IntegerAttr(0));
-    Result wrapped;
+    BasicResult wrapped;
     wrapped.pointer = std::move(result);
     return wrapped;
   }
@@ -727,7 +712,7 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
     result.offsets.valueType = target;
     result.offsets.shape = llvm::to_vector(target.getShape());
     result.offsets.completeOffset = complete;
-    Result wrapped;
+    BasicResult wrapped;
     wrapped.pointer = std::move(result);
     return wrapped;
   }
@@ -756,7 +741,7 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
       if (failed(opaque))
         return failure();
       result.offsets = std::move(*opaque);
-      Result wrapped;
+      BasicResult wrapped;
       wrapped.pointer = std::move(result);
       return wrapped;
     }
@@ -771,9 +756,26 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
   leaf.offsets.domain = ArithmeticDomain::ElementAddress;
   leaf.offsets.completeOffset = builder.getI64IntegerAttr(0);
   leaf.offsets.uniformOffset = builder.getI64IntegerAttr(0);
-  Result result;
+  BasicResult result;
   result.pointer = std::move(leaf);
   return result;
+}
+
+} // namespace
+
+FailureOr<BasicPointerRules::Result>
+BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
+                            OpBuilder &builder) const {
+  switch (request.kind) {
+  case SourceInteger:
+    return transferSourceInteger(request.value, inputs, options, builder);
+  case AddressDelta:
+    return transferAddressDelta(request.value, inputs, options, builder);
+  case OrdinaryPointer:
+    return transferOrdinaryPointer(request.value, inputs, options, builder);
+  default:
+    return failure();
+  }
 }
 
 LogicalResult BasicPointerRules::mapResultValues(
@@ -792,10 +794,6 @@ LogicalResult BasicPointerRules::mapResultValues(
 
 const OffsetComponents *getBasicOffset(const BasicResult &result) {
   return result.offset ? &*result.offset : nullptr;
-}
-
-const PointerComponents *getBasicPointer(const BasicResult &result) {
-  return result.pointer ? &*result.pointer : nullptr;
 }
 
 } // namespace mlir::triton::pointer::detail

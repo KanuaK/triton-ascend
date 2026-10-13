@@ -47,7 +47,6 @@ public:
 
   explicit BasicPointerRules(AnalysisOptions options) : options(options) {}
 
-  std::optional<Result> resolveBoundary(AnalysisRequest request) const;
   FailureOr<SmallVector<AnalysisRequest>>
   collectInputs(AnalysisRequest request) const;
   FailureOr<Result> transfer(AnalysisRequest request, ArrayRef<Result> inputs,
@@ -63,7 +62,6 @@ private:
 };
 
 const OffsetComponents *getBasicOffset(const BasicResult &result);
-const PointerComponents *getBasicPointer(const BasicResult &result);
 bool validOffsetBinding(Value boundary, const OffsetComponents &components,
                         ArithmeticDomain expectedDomain,
                         AnalysisOptions options);

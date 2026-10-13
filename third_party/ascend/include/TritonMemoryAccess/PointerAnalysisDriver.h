@@ -33,7 +33,6 @@
 
 #include <functional>
 #include <map>
-#include <optional>
 #include <utility>
 
 namespace mlir::triton::pointer::detail {
@@ -73,8 +72,9 @@ inline bool isOwnedBy(Value value, Operation *scope) {
   return owner && (owner == scope || scope->isAncestor(owner));
 }
 
-/// Rules must expose Result, resolveBoundary, collectInputs, transfer, and
-/// mapResultValues. Only this class traverses the producer graph.
+/// Rules must expose Result, collectInputs, transfer, and mapResultValues.
+/// Only this class traverses the producer graph; callers bind boundaries with
+/// bindBoundary().
 template <typename Rules> class AnalysisDriver {
 public:
   using Result = typename Rules::Result;
@@ -88,10 +88,6 @@ public:
       return failure();
     if (auto *completed = lookupCompleted(request))
       return *completed;
-    if (auto boundary = rules.resolveBoundary(request)) {
-      auto [it, inserted] = cache.emplace(request, *boundary);
-      return it->second;
-    }
     FailureOr<SmallVector<AnalysisRequest>> inputs =
         rules.collectInputs(request);
     if (failed(inputs))
@@ -232,9 +228,6 @@ public:
     bindings.clear();
     visits.clear();
   }
-
-  Rules &getRules() { return rules; }
-  const Rules &getRules() const { return rules; }
 
 private:
   OpBuilder &builder;

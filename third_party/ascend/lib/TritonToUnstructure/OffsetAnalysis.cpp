@@ -533,6 +533,11 @@ bool isCommonIntegerProducer(Operation *op) {
              triton::ExpandDimsOp>(op);
 }
 
+bool isCommonPointerProducer(Operation *op) {
+  return isa<triton::AddPtrOp, triton::SplatOp, triton::BroadcastOp,
+             triton::ExpandDimsOp, arith::SelectOp>(op);
+}
+
 } // namespace
 
 OffsetAnalysisContext::OffsetAnalysisContext(
@@ -698,10 +703,8 @@ bool OffsetAnalysisContext::preparePointerBoundaries(Value value) {
   if (cached != preparedPointers.end())
     return cached->second;
   Operation *op = value.getDefiningOp();
-  bool supported = op &&
-      isa<triton::AddPtrOp, triton::SplatOp, triton::BroadcastOp,
-          triton::ExpandDimsOp, arith::SelectOp>(op) &&
-      !requiresLocalAnalysis(value);
+  bool supported = op && isCommonPointerProducer(op) &&
+                   !requiresLocalAnalysis(value);
   if (!supported) {
     parse(value, value.getLoc(), *this);
     bool bound = bindLocalPointerBoundary(value);
@@ -743,13 +746,8 @@ bool OffsetAnalysisContext::parseCommonOffset(Value value) {
 
 bool OffsetAnalysisContext::parseCommonPointer(Value value) {
   Operation *op = value.getDefiningOp();
-  if (!op ||
-      !isa<triton::AddPtrOp, triton::SplatOp, triton::BroadcastOp,
-           triton::ExpandDimsOp, arith::SelectOp>(op) ||
+  if (!op || !isCommonPointerProducer(op) ||
       (!isScalarPointer(value) && !isTensorPointer(value)) ||
-      op->hasAttr(controlflow::kPointerDescriptorRebuildAttr) ||
-      op->hasAttr(controlflow::kPointerDescriptorStructuredAxesAttr) ||
-      op->hasAttr(controlflow::kPointerDescriptorOffsetFormAttr) ||
       requiresLocalAnalysis(value))
     return false;
   if (!preparePointerBoundaries(value))

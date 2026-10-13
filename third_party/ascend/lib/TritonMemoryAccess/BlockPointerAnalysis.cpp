@@ -183,16 +183,6 @@ buildAddressView(const BlockPointerComponents &block, OpBuilder &builder,
 
 namespace detail {
 
-std::optional<BlockPointerRules::Result>
-BlockPointerRules::resolveBoundary(AnalysisRequest request) const {
-  if (request.kind <= OrdinaryPointer) {
-    auto resolved = basic.resolveBoundary(request);
-    if (resolved)
-      return Result{*resolved, std::nullopt, std::nullopt};
-  }
-  return std::nullopt;
-}
-
 FailureOr<SmallVector<AnalysisRequest>>
 BlockPointerRules::collectInputs(AnalysisRequest request) const {
   if (request.kind != SourceInteger &&
