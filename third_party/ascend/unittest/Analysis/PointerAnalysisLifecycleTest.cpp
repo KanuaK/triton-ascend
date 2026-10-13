@@ -153,6 +153,37 @@ TEST(PointerAnalysisLifecycle, ExtensionSharesTheSourceNode) {
   EXPECT_TRUE(succeeded(verify(*module)));
 }
 
+TEST(PointerAnalysisLifecycle, ShapeRulesRequireSourceRange) {
+  MLIRContext context;
+  context.loadDialect<arith::ArithDialect, triton::TritonDialect>();
+  auto module = parseSourceString<ModuleOp>(R"mlir(
+    module { tt.func @shape_inputs(%x: i32, %lane: tensor<1xi32>) {
+      %splat = tt.splat %x : i32 -> tensor<4xi32>
+      %broadcast = tt.broadcast %lane : tensor<1xi32> -> tensor<4xi32>
+      %expand = tt.expand_dims %lane {axis = 0 : i32} : tensor<1xi32> -> tensor<1x1xi32>
+      tt.return
+    } }
+  )mlir", &context);
+  ASSERT_TRUE(module);
+  auto func = *module->getOps<triton::FuncOp>().begin();
+  OpBuilder builder(&context);
+  pointer_detail::BasicPointerRules rules({});
+  for (Operation &op : func.getBody().front()) {
+    if (!isa<triton::SplatOp, triton::BroadcastOp, triton::ExpandDimsOp>(&op))
+      continue;
+    builder.setInsertionPointAfter(&op);
+    auto offset = makeOpaqueOffset(op.getOperand(0), builder);
+    ASSERT_TRUE(succeeded(offset));
+    // An extension can supply an offset without the source range needed by
+    // basic rules. Report an unsupported input instead of dereferencing it.
+    SmallVector<pointer_detail::BasicResult, 1> inputs(1);
+    inputs.front().offset = *offset;
+    EXPECT_TRUE(failed(rules.transfer(
+        {op.getResult(0), pointer_detail::SourceInteger}, inputs, builder)));
+  }
+  EXPECT_TRUE(succeeded(verify(*module)));
+}
+
 TEST(PointerAnalysisLifecycle, InvalidBindingAndMappingLeaveCacheIntact) {
   MLIRContext context;
   context.loadDialect<arith::ArithDialect, scf::SCFDialect,

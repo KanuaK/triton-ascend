@@ -29,8 +29,10 @@
 
 namespace mlir::triton::pointer::detail {
 
-/// Only source-integer requests have a range. Unknown producers get the full
-/// source-width set, never a guessed interval or a zero-value proof.
+/// SourceInteger and AddressDelta results contain both offset and integerRange;
+/// OrdinaryPointer results contain pointer. Extensions may have no basic view.
+/// Unknown source producers get the full source-width range, never a guessed
+/// interval or a zero-value proof.
 struct BasicResult {
   std::optional<OffsetComponents> offset;
   std::optional<PointerComponents> pointer;

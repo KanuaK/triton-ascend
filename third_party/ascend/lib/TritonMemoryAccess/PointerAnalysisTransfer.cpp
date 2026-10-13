@@ -419,6 +419,11 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
     return result;
   }
   if (request.kind == SourceInteger) {
+    // Extensions may omit the basic view. Reject it before using any source
+    // operand; shape operations need the range just as arithmetic operations do.
+    for (const BasicResult &input : inputs)
+      if (!input.offset || !input.integerRange)
+        return failure();
     FailureOr<unsigned> width = getIntegerWidth(value.getType(), options);
     if (failed(width))
       return failure();
@@ -446,8 +451,7 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
       state = *invariantOffset(value, integerAttr(scalar, *constant, builder),
                                builder);
     } else if (auto select = value.getDefiningOp<arith::SelectOp>()) {
-      if (inputs.size() != 2 || !inputs[0].offset || !inputs[1].offset ||
-          !inputs[0].integerRange || !inputs[1].integerRange)
+      if (inputs.size() != 2)
         return failure();
       const auto &left = *inputs[0].offset;
       const auto &right = *inputs[1].offset;
@@ -488,14 +492,14 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
         }
       }
     } else if (auto splat = value.getDefiningOp<triton::SplatOp>()) {
-      if (inputs.size() != 1 || !inputs.front().offset ||
+      if (inputs.size() != 1 ||
           isa<RankedTensorType>(inputs.front().offset->valueType))
         return failure();
       state = *invariantOffset(value, inputs.front().offset->uniformOffset,
                                builder);
       range = *inputs.front().integerRange;
     } else if (auto broadcast = value.getDefiningOp<triton::BroadcastOp>()) {
-      if (inputs.size() != 1 || !inputs.front().offset)
+      if (inputs.size() != 1)
         return failure();
       const auto &src = *inputs.front().offset;
       if (src.shape.size() != state.shape.size())
@@ -517,7 +521,7 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
         state.uniformOffset = src.uniformOffset;
       range = *inputs.front().integerRange;
     } else if (auto expand = value.getDefiningOp<triton::ExpandDimsOp>()) {
-      if (inputs.size() != 1 || !inputs.front().offset)
+      if (inputs.size() != 1)
         return failure();
       const auto &src = *inputs.front().offset;
       unsigned axis = expand.getAxis();
@@ -533,8 +537,7 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
       range = *inputs.front().integerRange;
     } else if (value.getDefiningOp<arith::AddIOp>() ||
                value.getDefiningOp<arith::SubIOp>()) {
-      if (inputs.size() != 2 || !inputs[0].offset || !inputs[1].offset ||
-          !inputs[0].integerRange || !inputs[1].integerRange)
+      if (inputs.size() != 2)
         return failure();
       BinaryKind kind = value.getDefiningOp<arith::AddIOp>()
                             ? BinaryKind::Add
@@ -548,8 +551,7 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
                   ? inputs[0].integerRange->add(*inputs[1].integerRange)
                   : inputs[0].integerRange->sub(*inputs[1].integerRange);
     } else if (value.getDefiningOp<arith::MulIOp>()) {
-      if (inputs.size() != 2 || !inputs[0].offset || !inputs[1].offset ||
-          !inputs[0].integerRange || !inputs[1].integerRange)
+      if (inputs.size() != 2)
         return failure();
       const OffsetComponents &left = *inputs[0].offset;
       const OffsetComponents &right = *inputs[1].offset;
@@ -590,7 +592,7 @@ BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
                value.getDefiningOp<arith::TruncIOp>() ||
                value.getDefiningOp<arith::IndexCastOp>() ||
                value.getDefiningOp<arith::IndexCastUIOp>()) {
-      if (inputs.size() != 1 || !inputs[0].offset || !inputs[0].integerRange)
+      if (inputs.size() != 1)
         return failure();
       const auto &src = *inputs[0].offset;
       unsigned sourceWidth = inputs[0].integerRange->getBitWidth();
