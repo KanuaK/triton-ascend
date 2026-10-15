@@ -104,6 +104,7 @@ if __name__ == "__main__":
 | **CV 融合** | `enable_hivm_auto_cv_balance` | `None`、`True`、`False` | 启用或禁用自动 CV balance。 | `triton.Config` 或 Autotune 参数 |
 | **CV 融合** | `enable_cube_block_merge` | `False`（默认）、`True` | 控制 DynamicCV pipeline 的 Cube block merge。 | `triton.Config` 或 launch meta-parameter |
 | **VF 融合** | `vf_fusion_mode` | `None`（默认，遵循 BiShengIR 默认值 `"max-parallel"`）、`"max-parallel"`、`"all-op"`、`"ub-aware-op"` | 选择 Ascend 950PR&950DT products BiShengIR 阶段的 VF fusion 策略。 | `triton.Config` 或 launch meta-parameter |
+| **VF 融合** | `enable_vf_stack_limit` | `False`（默认）、`True` | 在 Ascend 950 的 BiShengIR 编译中，根据向量函数（VF）的栈占用估算限制融合，降低栈溢出风险；仅适用于 `compile_mode="simd"` 或 `"simd_simt_template"`，不适用于 A2/A3 或纯 SIMT。 | `triton.Config` 或 launch meta-parameter |
 | **VF 融合** | `enable_vf_fusion` | `None`（默认，遵循 BiShengIR 默认值 `True`）、`True`、`False` | 控制 Ascend 950PR&950DT products BiShengIR 阶段是否启用 VF fusion。该选项是 VF fusion 的总开关；`vf_fusion_mode` 仅用于选择融合策略。 | `triton.Config` 或 launch meta-parameter |
 | **HFusion** | `hfusion_enable_multiple_consumer_fusion` | `False`（默认）、`True` | 控制 Ascend 950PR&950DT products BiShengIR 阶段的多 consumer 融合。 | `triton.Config` 或 launch meta-parameter |
 | **CV 融合/同步** | `sync_solver` | `None`、`True`、`False` | 启用或禁用 HIVM 同步求解器。 | `triton.Config` 或 launch meta-parameter |
