@@ -126,6 +126,7 @@ configs = [
 | 算子优化 | `enable_flatten` | 控制 NPU 编译器的 flatten pass。 | `None`；布尔值 | 支持 | 常规路径 |
 | 算子优化 | `enable_auto_vectorize_v2` | 控制 NPU 编译器的 AutoVectorizeV2。 | `None`；布尔值 | 支持 | 常规路径 |
 | 算子优化 | `vf_fusion_mode` | 选择 VF fusion 策略。 | `None`，不传开关；`"max-parallel"`、`"all-op"`、`"ub-aware-op"` | — | 常规路径 |
+| 算子优化 | `enable_vf_stack_limit` | 在 BiShengIR 编译中根据向量函数（VF）的栈占用估算限制融合，降低栈溢出风险。 | `False`；布尔值 | — | 常规路径 |
 | 算子优化 | `hfusion_enable_multiple_consumer_fusion` | 控制多个消费者的 HFusion。 | `None`；布尔值 | — | 常规路径 |
 | 算子优化 | `enable_hivm_batch_matmul` | 为 BiShengIR 编译启用 batch matmul。 | `False`；布尔值 | — | 常规路径 |
 | 算子优化 | `auto_vectorize_v2_max_fused_ops_num` | 设置 AutoVectorizeV2 最大融合 op 数。 | `None`；整数 | — | 常规路径 |
