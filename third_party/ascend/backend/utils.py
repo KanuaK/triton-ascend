@@ -1099,7 +1099,6 @@ def _find_cann_version_file():
     return None
 
 
-@functools.lru_cache(None)
 def get_cann_version():
     try:
         version_file = _find_cann_version_file()
