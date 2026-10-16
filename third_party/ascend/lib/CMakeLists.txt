@@ -30,7 +30,6 @@ if(TRITON_ENABLE_COVERAGE_HITEST)
       TritonMemoryAccessCore
       TritonMemoryAccessAnalysis
       TritonPointerAnalysis
-      TritonBlockPointerAnalysis
       TritonAscendIR               # from Dialect/TritonAscend/IR
       TritonStructuredIR           # from Dialect/TritonStructured/IR
       AutoBlockify

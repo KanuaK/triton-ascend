@@ -24,6 +24,7 @@
 #define TRITON_ASCEND_MEMORY_ACCESS_POINTER_ANALYSIS_INTERNAL_H
 
 #include "TritonMemoryAccess/PointerAnalysis.h"
+#include "TritonMemoryAccess/PointerAnalysisTransfer.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpDefinition.h"
 #include "llvm/IR/ConstantRange.h"
@@ -36,6 +37,14 @@ inline bool supportsAddressAnalysis(AnalysisOptions options) {
 
 // Constraints of the current tt.make_range/expand/broadcast materialization.
 bool canMaterializeAddressTensor(RankedTensorType type);
+
+bool isBlockPointerType(Type type);
+bool validBlockPointerBinding(Value value, const PointerComponents &components);
+FailureOr<SmallVector<AnalysisRequest>>
+collectBlockPointerInputs(AnalysisRequest request);
+FailureOr<AnalysisResult> transferBlockPointer(AnalysisRequest request,
+                                               ArrayRef<AnalysisResult> inputs,
+                                               OpBuilder &builder);
 
 enum class BinaryKind { Add, Subtract, Multiply };
 enum class CastKind { Signed, Unsigned, Truncate };

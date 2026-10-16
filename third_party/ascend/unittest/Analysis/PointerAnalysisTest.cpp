@@ -407,8 +407,8 @@ TEST(PointerAnalysis, IndexCastWidthAndRangeMatrix) {
                          : Value(b.create<arith::IndexCastOp>(b.getUnknownLoc(),
                                                               out, x));
             b.create<triton::ReturnOp>(b.getUnknownLoc());
-            pointer_detail::AnalysisDriver<pointer_detail::BasicPointerRules>
-                driver(b, pointer_detail::BasicPointerRules({64, iw}));
+            pointer_detail::AnalysisDriver<pointer_detail::PointerRules> driver(
+                b, pointer_detail::PointerRules({64, iw}));
             auto result = driver.analyze({y, pointer_detail::SourceInteger});
             ASSERT_TRUE(succeeded(result));
             ASSERT_TRUE(result->integerRange);
@@ -565,8 +565,8 @@ TEST(PointerAnalysis, IntegerSelectUsesTheSameConditionForAffineFields) {
   SmallVector<arith::SelectOp> selects;
   f.walk([&](arith::SelectOp op) { selects.push_back(op); });
   OpBuilder b(&context);
-  pointer_detail::AnalysisDriver<pointer_detail::BasicPointerRules> driver(
-      b, pointer_detail::BasicPointerRules({}));
+  pointer_detail::AnalysisDriver<pointer_detail::PointerRules> driver(
+      b, pointer_detail::PointerRules({}));
   for (unsigned k = 0; k < selects.size(); ++k) {
     auto result = driver.analyze({selects[k], pointer_detail::SourceInteger});
     ASSERT_TRUE(succeeded(result));
@@ -897,7 +897,8 @@ TEST(PointerAnalysis, OpaqueFactoryPreservesDomainAndRankZeroContracts) {
                             %rankzero: tensor<i64>, %idx: index, %float: f32) {
       tt.return
     } }
-  )mlir", &context);
+  )mlir",
+                                            &context);
   ASSERT_TRUE(module);
   auto f = *module->getOps<triton::FuncOp>().begin();
   OpBuilder builder(&context);
@@ -916,7 +917,7 @@ TEST(PointerAnalysis, OpaqueFactoryPreservesDomainAndRankZeroContracts) {
   EXPECT_TRUE(failed(makeOpaqueOffset(Value(), builder)));
   EXPECT_TRUE(succeeded(makeOpaqueOffset(f.getArgument(3), builder)));
   auto lanes = makeOpaqueOffset(f.getArgument(1), builder,
-                                 ArithmeticDomain::ElementAddress);
+                                ArithmeticDomain::ElementAddress);
   ASSERT_TRUE(succeeded(lanes));
   EXPECT_EQ(lanes->completeOffset, OpFoldResult(f.getArgument(1)));
   EXPECT_EQ(lanes->domain, ArithmeticDomain::ElementAddress);

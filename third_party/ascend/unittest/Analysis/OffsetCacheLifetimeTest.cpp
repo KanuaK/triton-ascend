@@ -20,8 +20,8 @@
  * THE SOFTWARE.
  */
 
-#include "TritonToUnstructure/UnstructureConversionPass.h"
 #include "PointerAnalysisTestUtils.h"
+#include "TritonToUnstructure/UnstructureConversionPass.h"
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -355,7 +355,8 @@ TEST(OffsetAnalysisContext, NewBoundariesKeepLongPointerChainsLinear) {
       std::string ir = "module { tt.func @chain(%base: !tt.ptr<i32>";
       for (unsigned i = 0; i < length; ++i)
         ir += ", %x" + std::to_string(i) + ": tensor<8xi64>";
-      ir += ") { %p0 = tt.splat %base : !tt.ptr<i32> -> tensor<8x!tt.ptr<i32>>\n";
+      ir +=
+          ") { %p0 = tt.splat %base : !tt.ptr<i32> -> tensor<8x!tt.ptr<i32>>\n";
       for (unsigned i = 0; i < length; ++i)
         ir += "%p" + std::to_string(i + 1) + " = tt.addptr %p" +
               std::to_string(i) + ", %x" + std::to_string(i) +
@@ -416,7 +417,8 @@ TEST(OffsetAnalysisContext, SourceNormalizationIsAnExplicitPhase) {
       %flat = tt.reshape %ptr allow_reorder : tensor<2x4x!tt.ptr<i32>> -> tensor<8x!tt.ptr<i32>>
       tt.return
     } }
-  )mlir", &context);
+  )mlir",
+                                            &context);
   ASSERT_TRUE(module);
   auto f = *module->getOps<triton::FuncOp>().begin();
   auto reshape = *f.getBody().front().getOps<triton::ReshapeOp>().begin();

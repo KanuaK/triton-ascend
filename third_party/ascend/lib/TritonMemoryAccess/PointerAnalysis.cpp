@@ -34,11 +34,10 @@
 namespace mlir::triton::pointer {
 
 bool OffsetComponents::hasAffineForm() const {
-  return valueType && completeOffset && uniformOffset &&
-         axes.size() == shape.size() && strides.size() == shape.size() &&
-         llvm::none_of(axes, [](AxisKind axis) {
-           return axis == AxisKind::Unknown;
-         });
+  return valueType && uniformOffset && axes.size() == shape.size() &&
+         strides.size() == shape.size() &&
+         llvm::none_of(axes,
+                       [](AxisKind axis) { return axis == AxisKind::Unknown; });
 }
 
 bool OffsetComponents::isUniform() const {
@@ -62,7 +61,7 @@ std::optional<OpFoldResult> OffsetComponents::getAffineOrigin() const {
 }
 
 FailureOr<OffsetComponents> makeOpaqueOffset(Value value, OpBuilder &builder,
-                                            ArithmeticDomain domain) {
+                                             ArithmeticDomain domain) {
   if (!value || (!isa<IntegerType, IndexType>(value.getType()) &&
                  !isa<RankedTensorType>(value.getType())))
     return failure();
@@ -107,7 +106,8 @@ bool validOfrType(OpFoldResult value, Type expected) {
 }
 
 bool validOffset(Type input, const OffsetComponents &components,
-                 ArithmeticDomain expectedDomain, AnalysisOptions options) {
+                 ArithmeticDomain expectedDomain, AnalysisOptions options,
+                 bool allowAffineOnly = false) {
   Type resultType = input;
   if (expectedDomain == ArithmeticDomain::ElementAddress) {
     if (auto tensor = dyn_cast<RankedTensorType>(input))
@@ -124,7 +124,9 @@ bool validOffset(Type input, const OffsetComponents &components,
       components.axes.size() != components.shape.size() ||
       components.strides.size() != components.shape.size() ||
       failed(detail::getIntegerWidth(resultType, options)) ||
-      !validOfrType(components.completeOffset, resultType) ||
+      (components.completeOffset
+           ? !validOfrType(components.completeOffset, resultType)
+           : !allowAffineOnly || !components.hasAffineForm()) ||
       !validOfrType(components.uniformOffset, scalarType))
     return false;
   for (OpFoldResult stride : components.strides)
@@ -143,13 +145,21 @@ bool validPointer(Value boundary, const PointerComponents &components,
     pointerElement = tensor.getElementType();
   auto pointerType = dyn_cast<triton::PointerType>(pointerElement);
   auto baseType = dyn_cast<triton::PointerType>(components.base.getType());
-  if (!pointerType || !baseType ||
-      isa<ShapedType>(pointerType.getPointeeType()) ||
-      pointerType != baseType ||
-      components.elementType != pointerType.getPointeeType() ||
-      components.addressSpace != pointerType.getAddressSpace())
+  if (!pointerType || !baseType)
     return false;
-  Type source = boundary.getType();
+  auto blockType = dyn_cast<RankedTensorType>(pointerType.getPointeeType());
+  if (!blockType && isa<ShapedType>(pointerType.getPointeeType()))
+    return false;
+  Type elementType =
+      blockType ? blockType.getElementType() : pointerType.getPointeeType();
+  if (components.elementType != elementType ||
+      baseType.getPointeeType() != elementType ||
+      components.addressSpace != pointerType.getAddressSpace() ||
+      baseType.getAddressSpace() != components.addressSpace ||
+      (blockType ? !detail::validBlockPointerBinding(boundary, components)
+                 : components.block.has_value()))
+    return false;
+  Type source = blockType ? Type(blockType) : boundary.getType();
   if (auto tensor = dyn_cast<RankedTensorType>(source))
     source = RankedTensorType::get(tensor.getShape(),
                                    IntegerType::get(source.getContext(), 64),
@@ -157,7 +167,8 @@ bool validPointer(Value boundary, const PointerComponents &components,
   else
     source = IntegerType::get(source.getContext(), 64);
   return validOffset(source, components.offsets,
-                     ArithmeticDomain::ElementAddress, options);
+                     ArithmeticDomain::ElementAddress, options,
+                     /*allowAffineOnly=*/bool(blockType));
 }
 
 bool isNumericHelper(Operation *op) {
@@ -186,9 +197,9 @@ bool validPointerBinding(Value boundary, const PointerComponents &components,
 
 struct PointerAnalysis::Impl {
   explicit Impl(OpBuilder &builder, AnalysisOptions options)
-      : options(options), driver(builder, detail::BasicPointerRules(options)) {}
+      : options(options), driver(builder, detail::PointerRules(options)) {}
   AnalysisOptions options;
-  detail::AnalysisDriver<detail::BasicPointerRules> driver;
+  detail::AnalysisDriver<detail::PointerRules> driver;
 };
 
 PointerAnalysis::PointerAnalysis(OpBuilder &builder, AnalysisOptions options)
@@ -217,15 +228,40 @@ FailureOr<OffsetComponents> PointerAnalysis::analyzeAddressDelta(Value value) {
 FailureOr<PointerComponents> PointerAnalysis::analyzePointer(Value value) {
   if (!detail::supportsAddressAnalysis(impl->options))
     return failure();
-  auto result = impl->driver.analyze({value, detail::OrdinaryPointer});
+  auto result = impl->driver.analyze({value, detail::PointerValue});
   if (failed(result) || !result->pointer)
     return failure();
   return *result->pointer;
 }
 
+FailureOr<BlockAdvanceDelta>
+PointerAnalysis::analyzeBlockAdvanceDelta(triton::AdvanceOp op) {
+  if (!op || !detail::supportsAddressAnalysis(impl->options))
+    return failure();
+  auto result =
+      impl->driver.analyze({op.getResult(), detail::AdvanceDeltaRequest});
+  if (failed(result) || !result->advanceDelta)
+    return failure();
+  return *result->advanceDelta;
+}
+
+const PointerComponents *PointerAnalysis::findCachedPointer(Value value) const {
+  auto *result = impl->driver.lookupCompleted({value, detail::PointerValue});
+  return result && result->pointer ? &*result->pointer : nullptr;
+}
+
+const BlockAdvanceDelta *
+PointerAnalysis::findCachedBlockAdvanceDelta(triton::AdvanceOp op) const {
+  if (!op)
+    return nullptr;
+  auto *result = impl->driver.lookupCompleted(
+      {op.getResult(), detail::AdvanceDeltaRequest});
+  return result && result->advanceDelta ? &*result->advanceDelta : nullptr;
+}
+
 const OffsetComponents *PointerAnalysis::findCachedOffset(Value value) const {
   auto *result = impl->driver.lookupCompleted({value, detail::SourceInteger});
-  return result ? detail::getBasicOffset(*result) : nullptr;
+  return result ? detail::getOffset(*result) : nullptr;
 }
 
 const OffsetComponents *
@@ -233,7 +269,7 @@ PointerAnalysis::findCachedAddressDelta(Value value) const {
   if (!detail::supportsAddressAnalysis(impl->options))
     return nullptr;
   auto *result = impl->driver.lookupCompleted({value, detail::AddressDelta});
-  return result ? detail::getBasicOffset(*result) : nullptr;
+  return result ? detail::getOffset(*result) : nullptr;
 }
 
 LogicalResult PointerAnalysis::bindOffset(Value boundary,
@@ -241,7 +277,7 @@ LogicalResult PointerAnalysis::bindOffset(Value boundary,
   if (!detail::validOffsetBinding(
           boundary, components, ArithmeticDomain::SourceInteger, impl->options))
     return failure();
-  detail::BasicResult result;
+  detail::AnalysisResult result;
   result.offset = components;
   FailureOr<unsigned> width =
       detail::getIntegerWidth(boundary.getType(), impl->options);
@@ -256,9 +292,9 @@ PointerAnalysis::bindPointer(Value boundary,
                              const PointerComponents &components) {
   if (!detail::validPointerBinding(boundary, components, impl->options))
     return failure();
-  detail::BasicResult result;
+  detail::AnalysisResult result;
   result.pointer = components;
-  impl->driver.bindBoundary({boundary, detail::OrdinaryPointer},
+  impl->driver.bindBoundary({boundary, detail::PointerValue},
                             std::move(result));
   return success();
 }

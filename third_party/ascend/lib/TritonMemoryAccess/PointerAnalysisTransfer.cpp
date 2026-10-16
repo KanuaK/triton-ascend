@@ -164,7 +164,7 @@ bool affineFitsSigned(const OffsetComponents &source, unsigned width) {
 }
 
 FailureOr<OffsetComponents> projectAddress(Value value,
-                                           const BasicResult &source,
+                                           const AnalysisResult &source,
                                            AnalysisOptions options,
                                            OpBuilder &builder) {
   if (!source.offset || !source.integerRange ||
@@ -324,11 +324,14 @@ FailureOr<PointerComponents> addPointerOffsets(Value resultValue,
 } // namespace
 
 FailureOr<SmallVector<AnalysisRequest>>
-BasicPointerRules::collectInputs(AnalysisRequest request) const {
+PointerRules::collectInputs(AnalysisRequest request) const {
   if (request.kind != SourceInteger && !supportsAddressAnalysis(options))
     return failure();
   SmallVector<AnalysisRequest> result;
   Value value = request.value;
+  if (request.kind == AdvanceDeltaRequest ||
+      (request.kind == PointerValue && isBlockPointerType(value.getType())))
+    return collectBlockPointerInputs(request);
   if (request.kind == AddressDelta) {
     result.push_back({value, SourceInteger});
     return result;
@@ -363,49 +366,50 @@ BasicPointerRules::collectInputs(AnalysisRequest request) const {
       result.push_back({op.getSrc(), SourceInteger});
     return result;
   }
-  if (request.kind != OrdinaryPointer ||
-      !isOrdinaryPointerType(value.getType()))
+  if (request.kind != PointerValue || !isOrdinaryPointerType(value.getType()))
     return failure();
   if (auto op = value.getDefiningOp<triton::AddPtrOp>()) {
-    result = {{op.getPtr(), OrdinaryPointer}, {op.getOffset(), AddressDelta}};
+    result = {{op.getPtr(), PointerValue}, {op.getOffset(), AddressDelta}};
   } else if (auto op = value.getDefiningOp<triton::SplatOp>()) {
-    result.push_back({op.getSrc(), OrdinaryPointer});
+    result.push_back({op.getSrc(), PointerValue});
   } else if (auto op = value.getDefiningOp<triton::BroadcastOp>()) {
-    result.push_back({op.getSrc(), OrdinaryPointer});
+    result.push_back({op.getSrc(), PointerValue});
   } else if (auto op = value.getDefiningOp<triton::ExpandDimsOp>()) {
-    result.push_back({op.getSrc(), OrdinaryPointer});
+    result.push_back({op.getSrc(), PointerValue});
   } else if (auto op = value.getDefiningOp<arith::SelectOp>()) {
     if (isa<RankedTensorType>(value.getType()))
-      result = {{op.getTrueValue(), OrdinaryPointer},
-                {op.getFalseValue(), OrdinaryPointer}};
+      result = {{op.getTrueValue(), PointerValue},
+                {op.getFalseValue(), PointerValue}};
   }
   return result;
 }
 
 namespace {
 
-FailureOr<BasicResult>
-transferAddressDelta(Value value, ArrayRef<BasicResult> inputs,
-                     AnalysisOptions options, OpBuilder &builder) {
+FailureOr<AnalysisResult> transferAddressDelta(Value value,
+                                               ArrayRef<AnalysisResult> inputs,
+                                               AnalysisOptions options,
+                                               OpBuilder &builder) {
   if (inputs.size() != 1)
     return failure();
   FailureOr<OffsetComponents> projected =
       projectAddress(value, inputs.front(), options, builder);
   if (failed(projected))
     return failure();
-  BasicResult result;
+  AnalysisResult result;
   result.offset = std::move(*projected);
   const auto &range = *inputs.front().integerRange;
   result.integerRange = range.getBitWidth() < 64 ? range.signExtend(64) : range;
   return result;
 }
 
-FailureOr<BasicResult>
-transferSourceInteger(Value value, ArrayRef<BasicResult> inputs,
-                      AnalysisOptions options, OpBuilder &builder) {
+FailureOr<AnalysisResult> transferSourceInteger(Value value,
+                                                ArrayRef<AnalysisResult> inputs,
+                                                AnalysisOptions options,
+                                                OpBuilder &builder) {
   // Extensions may omit the basic view. Reject it before using any source
   // operand; shape operations need the range just as arithmetic operations do.
-  for (const BasicResult &input : inputs)
+  for (const AnalysisResult &input : inputs)
     if (!input.offset || !input.integerRange)
       return failure();
   FailureOr<unsigned> width = getIntegerWidth(value.getType(), options);
@@ -425,8 +429,7 @@ transferSourceInteger(Value value, ArrayRef<BasicResult> inputs,
     if (end <= start || end - start != state.shape[0])
       return failure();
     state.axes = {AxisKind::Structured};
-    state.uniformOffset =
-        integerAttr(scalar, llvm::APInt(32, start), builder);
+    state.uniformOffset = integerAttr(scalar, llvm::APInt(32, start), builder);
     state.strides = {integerAttr(scalar, llvm::APInt(32, 1), builder)};
     range = llvm::ConstantRange(llvm::APInt(32, start), llvm::APInt(32, end));
   } else if (FailureOr<llvm::APInt> constant =
@@ -444,8 +447,8 @@ transferSourceInteger(Value value, ArrayRef<BasicResult> inputs,
       state = left;
       state.completeOffset = value;
     } else if (select.getCondition().getType().isInteger(1) &&
-               left.valueType == right.valueType &&
-               left.hasAffineForm() && right.hasAffineForm()) {
+               left.valueType == right.valueType && left.hasAffineForm() &&
+               right.hasAffineForm()) {
       auto choose = [&](OpFoldResult lhs,
                         OpFoldResult rhs) -> FailureOr<OpFoldResult> {
         if (lhs == rhs)
@@ -454,11 +457,11 @@ transferSourceInteger(Value value, ArrayRef<BasicResult> inputs,
         auto r = materialize(rhs, scalar, builder, value.getLoc());
         if (failed(l) || failed(r))
           return failure();
-        return OpFoldResult(
-            builder
-                .create<arith::SelectOp>(value.getLoc(),
-                                         select.getCondition(), *l, *r)
-                .getResult());
+        return OpFoldResult(builder
+                                .create<arith::SelectOp>(value.getLoc(),
+                                                         select.getCondition(),
+                                                         *l, *r)
+                                .getResult());
       };
       auto uniform = choose(left.uniformOffset, right.uniformOffset);
       if (failed(uniform))
@@ -479,8 +482,8 @@ transferSourceInteger(Value value, ArrayRef<BasicResult> inputs,
     if (inputs.size() != 1 ||
         isa<RankedTensorType>(inputs.front().offset->valueType))
       return failure();
-    state = invariantOffset(value, inputs.front().offset->uniformOffset,
-                            builder);
+    state =
+        invariantOffset(value, inputs.front().offset->uniformOffset, builder);
     range = *inputs.front().integerRange;
   } else if (auto broadcast = value.getDefiningOp<triton::BroadcastOp>()) {
     if (inputs.size() != 1)
@@ -600,17 +603,17 @@ transferSourceInteger(Value value, ArrayRef<BasicResult> inputs,
       // A proven nonnegative affine value can still have a negative stride
       // (e.g. 3 - range). Extend the coefficient as signed, not as extui.
       FailureOr<OpFoldResult> converted =
-          foldOrCreateCast(src.strides[axis], scalar, CastKind::Signed,
-                           options, builder, value.getLoc());
+          foldOrCreateCast(src.strides[axis], scalar, CastKind::Signed, options,
+                           builder, value.getLoc());
       if (failed(converted))
         return failure();
       state.strides.push_back(*converted);
     }
     if (state.hasAffineForm()) {
-      FailureOr<OpFoldResult> converted = foldOrCreateCast(
-          src.uniformOffset, scalar,
-          unsignedCast ? CastKind::Unsigned : CastKind::Signed, options,
-          builder, value.getLoc());
+      FailureOr<OpFoldResult> converted =
+          foldOrCreateCast(src.uniformOffset, scalar,
+                           unsignedCast ? CastKind::Unsigned : CastKind::Signed,
+                           options, builder, value.getLoc());
       if (failed(converted))
         return failure();
       state.uniformOffset = *converted;
@@ -624,14 +627,14 @@ transferSourceInteger(Value value, ArrayRef<BasicResult> inputs,
     else
       range = inputs[0].integerRange->signExtend(*width);
   }
-  BasicResult result;
+  AnalysisResult result;
   result.offset = std::move(state);
   result.integerRange = std::move(range);
   return result;
 }
 
-FailureOr<BasicResult>
-transferOrdinaryPointer(Value value, ArrayRef<BasicResult> inputs,
+FailureOr<AnalysisResult>
+transferOrdinaryPointer(Value value, ArrayRef<AnalysisResult> inputs,
                         AnalysisOptions options, OpBuilder &builder) {
   if (!isOrdinaryPointerType(value.getType()))
     return failure();
@@ -644,7 +647,7 @@ transferOrdinaryPointer(Value value, ArrayRef<BasicResult> inputs,
         value, *inputs[0].pointer, *inputs[1].offset, options, builder);
     if (failed(updated))
       return failure();
-    BasicResult result;
+    AnalysisResult result;
     result.pointer = std::move(*updated);
     return result;
   }
@@ -666,7 +669,7 @@ transferOrdinaryPointer(Value value, ArrayRef<BasicResult> inputs,
     result.offsets.axes.assign(tensor.getRank(), AxisKind::Invariant);
     result.offsets.strides.assign(tensor.getRank(),
                                   builder.getI64IntegerAttr(0));
-    BasicResult wrapped;
+    AnalysisResult wrapped;
     wrapped.pointer = std::move(result);
     return wrapped;
   }
@@ -712,7 +715,7 @@ transferOrdinaryPointer(Value value, ArrayRef<BasicResult> inputs,
     result.offsets.valueType = target;
     result.offsets.shape = llvm::to_vector(target.getShape());
     result.offsets.completeOffset = complete;
-    BasicResult wrapped;
+    AnalysisResult wrapped;
     wrapped.pointer = std::move(result);
     return wrapped;
   }
@@ -741,7 +744,7 @@ transferOrdinaryPointer(Value value, ArrayRef<BasicResult> inputs,
       if (failed(opaque))
         return failure();
       result.offsets = std::move(*opaque);
-      BasicResult wrapped;
+      AnalysisResult wrapped;
       wrapped.pointer = std::move(result);
       return wrapped;
     }
@@ -756,29 +759,33 @@ transferOrdinaryPointer(Value value, ArrayRef<BasicResult> inputs,
   leaf.offsets.domain = ArithmeticDomain::ElementAddress;
   leaf.offsets.completeOffset = builder.getI64IntegerAttr(0);
   leaf.offsets.uniformOffset = builder.getI64IntegerAttr(0);
-  BasicResult result;
+  AnalysisResult result;
   result.pointer = std::move(leaf);
   return result;
 }
 
 } // namespace
 
-FailureOr<BasicPointerRules::Result>
-BasicPointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
-                            OpBuilder &builder) const {
+FailureOr<PointerRules::Result>
+PointerRules::transfer(AnalysisRequest request, ArrayRef<Result> inputs,
+                       OpBuilder &builder) const {
   switch (request.kind) {
   case SourceInteger:
     return transferSourceInteger(request.value, inputs, options, builder);
   case AddressDelta:
     return transferAddressDelta(request.value, inputs, options, builder);
-  case OrdinaryPointer:
+  case PointerValue:
+    if (isBlockPointerType(request.value.getType()))
+      return transferBlockPointer(request, inputs, builder);
     return transferOrdinaryPointer(request.value, inputs, options, builder);
+  case AdvanceDeltaRequest:
+    return transferBlockPointer(request, inputs, builder);
   default:
     return failure();
   }
 }
 
-LogicalResult BasicPointerRules::mapResultValues(
+LogicalResult PointerRules::mapResultValues(
     Result &result, llvm::function_ref<FailureOr<Value>(Value)> mapper) const {
   if (result.offset && failed(mapOffsetValues(*result.offset, mapper)))
     return failure();
@@ -788,11 +795,22 @@ LogicalResult BasicPointerRules::mapResultValues(
         failed(mapOffsetValues(result.pointer->offsets, mapper)))
       return failure();
     result.pointer->base = *base;
+    if (result.pointer->block) {
+      auto &block = *result.pointer->block;
+      for (auto *fields : {&block.parentShape, &block.coordinateOffsets})
+        for (OpFoldResult &field : *fields)
+          if (failed(mapOfr(field, mapper)))
+            return failure();
+    }
   }
+  if (result.advanceDelta)
+    for (OpFoldResult &field : result.advanceDelta->coordinateDeltas)
+      if (failed(mapOfr(field, mapper)))
+        return failure();
   return success();
 }
 
-const OffsetComponents *getBasicOffset(const BasicResult &result) {
+const OffsetComponents *getOffset(const AnalysisResult &result) {
   return result.offset ? &*result.offset : nullptr;
 }
 
