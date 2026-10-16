@@ -209,9 +209,10 @@ class NPULauncher(object):
         self.shared = metadata.shared
         key_index = lambda key: src.fn.arg_names.index(key) if isinstance(key, str) else key
         self.signature = {key_index(key): value for key, value in src.signature.items()}
+        constants = {key_index(key) for key in getattr(src, "constants", {})}
         npu_utils = NPUUtils()
         self.launch_spec = make_launch_spec(metadata, npu_utils)
-        self._argument_types = argument_types(self.signature)
+        self._argument_types = argument_types(self.signature, constants)
         runtime, self._runtime_path = get_runtime(npu_utils.get_so_path(), metadata.debug)
         native = runtime.create_launcher(self.launch_spec.as_dict(), self._argument_types)
         self.launch = wrap_handle_tensordesc(native, self.signature)

@@ -218,18 +218,25 @@ def _descriptor_signature(sig):
     return ["*" + dtype, *(["i64"] * (2 * rank)), "i1", *(["i32"] * rank), *(["i64"] * rank)]
 
 
-def _expand_signature(sig):
+def _expand_signature(sig, constants=(), path=()):
+    if path in constants:
+        # Keep the Python input positions, including expanded tuple/descriptor
+        # fields, while excluding their values from the device parameter buffer.
+        return ["constexpr"] * len(_expand_signature(sig))
     if isinstance(sig, tuple):
-        return [ty for child in sig for ty in _expand_signature(child)]
+        return [ty for index, child in enumerate(sig) for ty in _expand_signature(child, constants, (*path, index))]
     if sig.startswith("tensordesc"):
         return _descriptor_signature(sig)
     return [sig]
 
 
-def argument_types(signature):
+def argument_types(signature, constants=()):
+    # Constants refer to original argument paths, before descriptor expansion
+    # and tuple flattening. They can fold values whose signature remains typed.
+    constant_paths = {key if isinstance(key, tuple) else (key, ) for key in constants}
     result = []
-    for sig in signature.values():
-        for ty in _expand_signature(sig):
+    for index, sig in signature.items():
+        for ty in _expand_signature(sig, constant_paths, (index, )):
             if ty.startswith("*"):
                 result.append((POINTER, utils.convert_sigtype_to_int(ty[1:])))
             else:

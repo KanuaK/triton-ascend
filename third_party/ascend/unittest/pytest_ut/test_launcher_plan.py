@@ -113,6 +113,26 @@ def test_empty_and_constexpr_arguments():
                                                                       (launcher.F32, -1)]
 
 
+@pytest.mark.parametrize("signature,constants,expected", [
+    ({0: "*fp32", 1: "i32", 2: "i32"}, {(1, ): 196}, ["*fp32", "constexpr", "i32"]),
+    ({0: "*fp32", 1: "i32", 2: "i32"}, {(2, ): 196, (3, ): 64, (4, ): 196}, ["*fp32", "i32", "constexpr"]),
+    ({0: "*fp32", 2: "i32"}, {(1, ): 64}, ["*fp32", "i32"]),
+    ({0: ("i32", "i32"), 1: "constexpr"}, {(1, ): 64}, ["i32", "i32", "constexpr"]),
+    ({0: ("i32", ("i32", "*fp32")), 1: "i32"}, {(0, 1, 0): 196}, ["i32", "constexpr", "*fp32", "i32"]),
+    ({0: ("i32", "i32"), 1: "i32"}, {(0, ): (3, 7)}, ["constexpr", "constexpr", "i32"]),
+])
+def test_folded_arguments_use_original_paths(signature, constants, expected):
+    assert launcher.argument_types(signature, constants) == launcher.argument_types(dict(enumerate(expected)))
+
+
+@pytest.mark.parametrize("folded_type", ["constexpr", "i32"])
+def test_folded_argument_after_descriptor_preserves_descriptor_fields(folded_type):
+    signature = {0: "tensordesc<fp32[16,32]>", 1: folded_type, 2: "i32"}
+    types = launcher.argument_types(signature, {(1, ): 196, (3, ): 64})
+    descriptor = launcher.argument_types({0: signature[0]})
+    assert types == [*descriptor, (launcher.CONSTEXPR, -1), (launcher.I32, -1)]
+
+
 def test_nested_descriptor_and_tuple_expansion():
     signature = {0: ("i32", ("tensordesc<fp32[16,32]>", "constexpr")), 1: "*fp32"}
     descriptor = SimpleNamespace(base=1234, shape=(16, 32), strides=(32, 1), padding="nan")
@@ -211,6 +231,25 @@ def prepared_backend(tmp_path, monkeypatch):
     monkeypatch.setattr(launcher, "_load_runtime", lambda path: module)
     src = SimpleNamespace(signature={0: "*fp32"}, fn=SimpleNamespace(arg_names=["x"]))
     return SimpleNamespace(driver=driver, root=source_dir, builds=builds, fingerprint=fingerprint, src=src)
+
+
+@pytest.mark.parametrize("constant_key", ["folded", 1, (1, )])
+@pytest.mark.parametrize("named_signature", [False, True])
+def test_folded_arguments_reach_runtime_and_export(prepared_backend, monkeypatch, constant_key, named_signature):
+    state = prepared_backend
+    names = ["out", "folded", "tail"]
+    signature = dict(zip(names if named_signature else range(3), ["*i32", "i32", "i32"]))
+    src = SimpleNamespace(signature=signature, constants={constant_key: 196}, fn=SimpleNamespace(arg_names=names))
+    exported = []
+    monkeypatch.setattr(state.driver, "export_launcher",
+                        lambda spec, types, *args: exported.append(types) or "/export.so")
+    instance = state.driver.NPULauncher(src, metadata())
+    expected = launcher.argument_types({0: "*i32", 1: "constexpr", 2: "i32"})
+    assert instance.launch.types == expected
+    assert instance.get_launcher_so_path() == "/export.so"
+    assert exported == [expected]
+    assert src.signature == signature
+    assert instance.signature == {0: "*i32", 1: "i32", 2: "i32"}
 
 
 def test_helper_optimization_flags_invalidate_cached_artifact(prepared_backend, monkeypatch):

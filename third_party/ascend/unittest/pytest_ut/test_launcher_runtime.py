@@ -60,6 +60,19 @@ def _mixed_argument_echo(out, small, fractional, source, short, wide, BIAS: tl.c
 
 
 @triton.jit
+def _folded_argument_echo(out, first, middle, last, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    # Bound all writes even with an incorrect grid read from a broken launcher.
+    active = (pid < 3) & (tl.program_id(1) == 0) & (tl.program_id(2) == 0)
+    tl.store(out + pid * 6 + 0, first, active)
+    tl.store(out + pid * 6 + 1, middle, active)
+    tl.store(out + pid * 6 + 2, last + BLOCK, active)
+    tl.store(out + pid * 6 + 3, tl.num_programs(0), active)
+    tl.store(out + pid * 6 + 4, tl.num_programs(1), active)
+    tl.store(out + pid * 6 + 5, tl.num_programs(2), active)
+
+
+@triton.jit
 def _grid_echo(out):
     x = tl.program_id(0)
     y = tl.program_id(1)
@@ -158,6 +171,48 @@ def test_mixed_scalar_abi_matches_device_and_c_entry(unsigned):
               [ctypes.c_void_p(output.data_ptr()), *(kind(value) for kind, value in zip(ctypes_types, values))])
     torch.npu.synchronize()
     assert output.cpu().tolist() == values
+
+
+@pytest.mark.parametrize("taskqueue", [False, True])
+@pytest.mark.parametrize("folded", ["first", "last"])
+def test_value_folded_arguments_preserve_values_and_grid(monkeypatch, tmp_path, taskqueue, folded):
+    monkeypatch.setenv("TRITON_ENABLE_TASKQUEUE", str(taskqueue))
+    # Match Inductor: a folded scalar stays i32, and a tile constexpr is absent
+    # from the signature altogether. Folding must precede ABI layout creation.
+    signature = {"out": "*i32", "first": "i32", "middle": "i32", "last": "i32"}
+    # ASTSource.hash() currently omits constant keys, so isolate specializations
+    # that fold the same value at different argument positions.
+    with triton.knobs.cache.scope():
+        triton.knobs.cache.dir = str(tmp_path / "cache")
+        compiled = triton.compile(
+            ASTSource(_folded_argument_echo, signature=signature, constexprs={folded: 196, "BLOCK": 8}))
+    values = {"first": 5, "middle": 7, "last": 11}
+    values[folded] = 196
+    output = torch.full((3, 6), -1, dtype=torch.int32, device="npu")
+    expected = [[values["first"], values["middle"], values["last"] + 8, 3, 1, 1]] * 3
+    instance = _native(compiled)
+    args = (output, *values.values())
+    grid = (3, 1, 1)
+    _run(instance, compiled, args, grid=grid)
+    torch.npu.synchronize()
+    assert output.cpu().tolist() == expected
+
+    output.fill_(-2)
+    module_spec = importlib.util.spec_from_file_location("__triton_launcher", instance.get_launcher_so_path())
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    module.launch(*grid,
+                  driver.NPUDriver().get_current_stream(), compiled.function, compiled.packed_metadata, None, None,
+                  None, *args)
+    torch.npu.synchronize()
+    assert output.cpu().tolist() == expected
+
+    output.fill_(-3)
+    _c_launch(instance, compiled, [
+        ctypes.c_void_p(output.data_ptr()), *(ctypes.c_int32(value) for name, value in values.items() if name != folded)
+    ], grid=grid)
+    torch.npu.synchronize()
+    assert output.cpu().tolist() == expected
 
 
 @pytest.mark.parametrize("taskqueue", [False, True])
