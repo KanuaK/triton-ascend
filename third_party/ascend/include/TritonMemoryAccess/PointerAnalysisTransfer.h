@@ -30,22 +30,24 @@
 namespace mlir::triton::pointer::detail {
 
 /// SourceInteger and AddressDelta results contain both offset and integerRange;
-/// OrdinaryPointer results contain pointer. Extensions may have no basic view.
+/// PointerValue results contain pointer for every pointer form; advance operand
+/// queries contain advanceDelta. Extensions may have none of these fields.
 /// Unknown source producers get the full source-width range, never a guessed
 /// interval or a zero-value proof.
-struct BasicResult {
+struct AnalysisResult {
   std::optional<OffsetComponents> offset;
   std::optional<PointerComponents> pointer;
   std::optional<llvm::ConstantRange> integerRange;
+  std::optional<BlockAdvanceDelta> advanceDelta;
 };
 
 /// Nonrecursive rules. A caller can combine this with extra result fields and
 /// operand requests while keeping AnalysisDriver as the only traversal.
-class BasicPointerRules {
+class PointerRules {
 public:
-  using Result = BasicResult;
+  using Result = AnalysisResult;
 
-  explicit BasicPointerRules(AnalysisOptions options) : options(options) {}
+  explicit PointerRules(AnalysisOptions options) : options(options) {}
 
   FailureOr<SmallVector<AnalysisRequest>>
   collectInputs(AnalysisRequest request) const;
@@ -55,13 +57,11 @@ public:
   mapResultValues(Result &result,
                   llvm::function_ref<FailureOr<Value>(Value)> mapper) const;
 
-  AnalysisOptions getOptions() const { return options; }
-
 private:
   AnalysisOptions options;
 };
 
-const OffsetComponents *getBasicOffset(const BasicResult &result);
+const OffsetComponents *getOffset(const AnalysisResult &result);
 bool validOffsetBinding(Value boundary, const OffsetComponents &components,
                         ArithmeticDomain expectedDomain,
                         AnalysisOptions options);

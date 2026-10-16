@@ -37,7 +37,6 @@ add_triton_ut(
     PointerAnalysisLifecycleTest.cpp
   LIBS
     TritonPointerAnalysis
-    TritonBlockPointerAnalysis
     TritonIR
     TritonGPUIR
     TritonGPUTransforms

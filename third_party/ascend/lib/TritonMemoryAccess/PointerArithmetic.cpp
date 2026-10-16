@@ -302,7 +302,9 @@ LogicalResult mapOfr(OpFoldResult &value,
 LogicalResult
 mapOffsetValues(OffsetComponents &components,
                 llvm::function_ref<FailureOr<Value>(Value)> mapper) {
-  if (failed(mapOfr(components.completeOffset, mapper)) ||
+  // Block descriptors can retain only the affine form until materialization.
+  if ((components.completeOffset &&
+       failed(mapOfr(components.completeOffset, mapper))) ||
       failed(mapOfr(components.uniformOffset, mapper)))
     return failure();
   for (OpFoldResult &stride : components.strides)

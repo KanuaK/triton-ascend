@@ -41,8 +41,7 @@ namespace mlir::triton::pointer::detail {
 enum RequestKind : unsigned {
   SourceInteger,
   AddressDelta,
-  OrdinaryPointer,
-  BlockPointer,
+  PointerValue,
   AdvanceDeltaRequest,
   FirstExtensionRequest,
 };
@@ -104,9 +103,8 @@ public:
     // Component helpers may be later than the original producer. Include every
     // value exposed by the rules (including extension fields) in the placement
     // constraint, so subsequent requests never insert before their operands.
-    const bool beforePointer = request.kind == OrdinaryPointer ||
-                               request.kind == BlockPointer ||
-                               request.kind == AdvanceDeltaRequest;
+    const bool beforePointer =
+        request.kind == PointerValue || request.kind == AdvanceDeltaRequest;
     Operation *producer = request.value.getDefiningOp();
     Block *block = producer ? producer->getBlock()
                             : cast<BlockArgument>(request.value).getOwner();

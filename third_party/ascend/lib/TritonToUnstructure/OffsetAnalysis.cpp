@@ -436,8 +436,8 @@ void normalizePointerAnalysisInputs(Operation *scope, RewriterBase &rewriter) {
         OffsetAnalysisContext context(rewriter, facts, scope);
         parse(reshape.getSrc(), reshape.getLoc(), context);
         const auto &info = facts.at(reshape.getSrc());
-        hasScalarBase = info.getPtr() && isScalarPointer(info.getPtr()) &&
-                        info.getOffset();
+        hasScalarBase =
+            info.getPtr() && isScalarPointer(info.getPtr()) && info.getOffset();
       }
       if (hasScalarBase)
         rewriter.modifyOpInPlace(reshape,
@@ -455,9 +455,8 @@ void normalizePointerAnalysisInputs(Operation *scope, RewriterBase &rewriter) {
         !resultType || !offsetType || !splat ||
         !isScalarPointer(splat.getSrc()) ||
         axes.size() != static_cast<size_t>(resultType.getRank()) ||
-        axes.empty() || !llvm::all_of(axes.asArrayRef(), [](int32_t a) {
-          return a == 0;
-        }) ||
+        axes.empty() ||
+        !llvm::all_of(axes.asArrayRef(), [](int32_t a) { return a == 0; }) ||
         resultType.getShape() != offsetType.getShape() ||
         resultType.getEncoding() != offsetType.getEncoding())
       continue;
@@ -471,11 +470,11 @@ void normalizePointerAnalysisInputs(Operation *scope, RewriterBase &rewriter) {
       OffsetAnalysisContext context(rewriter, facts, scope);
       parse(add.getOffset(), add.getLoc(), context);
       if (!getRecoverableCarrierAxes(facts.at(add.getOffset()),
-                                    resultType.getRank(), recoveredAxes))
+                                     resultType.getRank(), recoveredAxes))
         continue;
     }
-    Value offset = materializeAffineForOffsetCarrier(add.getOffset(), add,
-                                                     rewriter);
+    Value offset =
+        materializeAffineForOffsetCarrier(add.getOffset(), add, rewriter);
     if (!offset)
       continue;
     rewriter.modifyOpInPlace(add, [&] {
@@ -643,7 +642,8 @@ void OffsetAnalysisContext::bindLocalOffsetBoundary(Value value) {
   if (offsetBoundaries.contains(value))
     return;
   auto components = pointer::makeOpaqueOffset(value, rewriter);
-  if (succeeded(components) && succeeded(analysis.bindOffset(value, *components)))
+  if (succeeded(components) &&
+      succeeded(analysis.bindOffset(value, *components)))
     offsetBoundaries.insert(value);
 }
 
@@ -703,8 +703,8 @@ bool OffsetAnalysisContext::preparePointerBoundaries(Value value) {
   if (cached != preparedPointers.end())
     return cached->second;
   Operation *op = value.getDefiningOp();
-  bool supported = op && isCommonPointerProducer(op) &&
-                   !requiresLocalAnalysis(value);
+  bool supported =
+      op && isCommonPointerProducer(op) && !requiresLocalAnalysis(value);
   if (!supported) {
     parse(value, value.getLoc(), *this);
     bool bound = bindLocalPointerBoundary(value);

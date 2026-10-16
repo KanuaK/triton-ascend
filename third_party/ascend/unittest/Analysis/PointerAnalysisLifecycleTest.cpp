@@ -21,8 +21,6 @@
  */
 
 #include "PointerAnalysisTestUtils.h"
-#include "TritonMemoryAccess/BlockPointerAnalysis.h"
-#include "TritonMemoryAccess/BlockPointerAnalysisTransfer.h"
 #include "TritonMemoryAccess/PointerAnalysis.h"
 #include "TritonMemoryAccess/PointerAnalysisDriver.h"
 #include "TritonMemoryAccess/PointerAnalysisTransfer.h"
@@ -34,7 +32,6 @@
 #include "mlir/Parser/Parser.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "gtest/gtest.h"
-#include <type_traits>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -45,13 +42,13 @@ namespace {
 namespace pointer_detail = mlir::triton::pointer::detail;
 
 struct ExtraResult {
-  pointer_detail::BasicResult basic;
+  pointer_detail::AnalysisResult basic;
   Value extra;
 };
 
 struct ExtraRules {
   using Result = ExtraResult;
-  pointer_detail::BasicPointerRules basic{AnalysisOptions{}};
+  pointer_detail::PointerRules basic{AnalysisOptions{}};
 
   FailureOr<SmallVector<pointer_detail::AnalysisRequest>>
   collectInputs(pointer_detail::AnalysisRequest request) const {
@@ -85,7 +82,7 @@ struct ExtraRules {
       return Result{inputs[0].basic,
                     cast<Value>(inputs[0].basic.offset->completeOffset)};
     }
-    SmallVector<pointer_detail::BasicResult, 1> operands;
+    SmallVector<pointer_detail::AnalysisResult, 1> operands;
     for (const Result &input : inputs)
       operands.push_back(input.basic);
     auto result = basic.transfer(request, operands, builder);
@@ -153,11 +150,12 @@ TEST(PointerAnalysisLifecycle, ShapeRulesRequireSourceRange) {
       %expand = tt.expand_dims %lane {axis = 0 : i32} : tensor<1xi32> -> tensor<1x1xi32>
       tt.return
     } }
-  )mlir", &context);
+  )mlir",
+                                            &context);
   ASSERT_TRUE(module);
   auto func = *module->getOps<triton::FuncOp>().begin();
   OpBuilder builder(&context);
-  pointer_detail::BasicPointerRules rules({});
+  pointer_detail::PointerRules rules({});
   for (Operation &op : func.getBody().front()) {
     if (!isa<triton::SplatOp, triton::BroadcastOp, triton::ExpandDimsOp>(&op))
       continue;
@@ -166,7 +164,7 @@ TEST(PointerAnalysisLifecycle, ShapeRulesRequireSourceRange) {
     ASSERT_TRUE(succeeded(offset));
     // An extension can supply an offset without the source range needed by
     // basic rules. Report an unsupported input instead of dereferencing it.
-    SmallVector<pointer_detail::BasicResult, 1> inputs(1);
+    SmallVector<pointer_detail::AnalysisResult, 1> inputs(1);
     inputs.front().offset = *offset;
     EXPECT_TRUE(failed(rules.transfer(
         {op.getResult(0), pointer_detail::SourceInteger}, inputs, builder)));
@@ -350,7 +348,7 @@ TEST(PointerAnalysisLifecycle, CloneEraseRemapsAllPublicFieldsAtomically) {
   Value inner = *root.getThenRegion().front().getOps<arith::AddIOp>().begin();
   auto next = *f.getBody().front().getOps<triton::AdvanceOp>().begin();
   OpBuilder b(f.getBody().front().getTerminator());
-  BlockPointerAnalysis analysis(b);
+  PointerAnalysis analysis(b);
   OffsetComponents offset;
   offset.valueType = f.getArgument(4).getType();
   offset.shape = {4};
@@ -366,25 +364,29 @@ TEST(PointerAnalysisLifecycle, CloneEraseRemapsAllPublicFieldsAtomically) {
   pointer.offsets = offset;
   pointer.offsets.domain = ArithmeticDomain::ElementAddress;
   ASSERT_TRUE(succeeded(analysis.bindPointer(f.getArgument(5), pointer)));
-  BlockPointerComponents block;
+  PointerComponents block;
+  block.block.emplace();
   block.base = root.getResult(2);
-  block.blockShape = {4};
-  block.order = {0};
-  block.blockTensorType = RankedTensorType::get({4}, b.getI32Type());
+  block.offsets.valueType = RankedTensorType::get({4}, b.getI64Type());
+  block.offsets.domain = ArithmeticDomain::ElementAddress;
+  block.offsets.shape = {4};
+  block.offsets.uniformOffset = root.getResult(1);
+  block.offsets.axes = {AxisKind::Structured};
+  block.block->order = {0};
   block.elementType = b.getI32Type();
   block.addressSpace = 1;
-  block.parentShape = {root.getResult(1)};
-  block.coordinateOffsets = {root.getResult(1)};
-  block.strides = {root.getResult(1)};
-  block.coordinateRanges = {llvm::ConstantRange::getFull(64)};
-  ASSERT_TRUE(succeeded(analysis.bindBlockPointer(f.getArgument(6), block)));
+  block.block->parentShape = {root.getResult(1)};
+  block.block->coordinateOffsets = {root.getResult(1)};
+  block.offsets.strides = {root.getResult(1)};
+  block.block->coordinateRanges = {llvm::ConstantRange::getFull(64)};
+  ASSERT_TRUE(succeeded(analysis.bindPointer(f.getArgument(6), block)));
   ASSERT_TRUE(succeeded(analysis.analyzeOffset(inner)));
   ASSERT_TRUE(succeeded(analysis.analyzeOffset(f.getArgument(2))));
   ASSERT_TRUE(succeeded(analysis.analyzeOffset(root.getResult(0))));
   ASSERT_TRUE(succeeded(analysis.analyzeBlockAdvanceDelta(next)));
-  pointer_detail::AnalysisDriver<pointer_detail::BlockPointerRules> deltaDriver(
-      b, pointer_detail::BlockPointerRules({}));
-  pointer_detail::BlockResult deltaBinding;
+  pointer_detail::AnalysisDriver<pointer_detail::PointerRules> deltaDriver(
+      b, pointer_detail::PointerRules({}));
+  pointer_detail::AnalysisResult deltaBinding;
   deltaBinding.advanceDelta = BlockAdvanceDelta{
       {root.getResult(1)}, {llvm::ConstantRange::getFull(64)}};
   deltaDriver.bindBoundary({next, pointer_detail::AdvanceDeltaRequest},
@@ -417,12 +419,13 @@ TEST(PointerAnalysisLifecycle, CloneEraseRemapsAllPublicFieldsAtomically) {
   EXPECT_EQ(mappedPointer->base, clone->getResult(2));
   EXPECT_EQ(cast<Value>(mappedPointer->offsets.completeOffset),
             clone->getResult(0));
-  auto mappedBlock = analysis.analyzeBlockPointer(f.getArgument(6));
+  auto mappedBlock = analysis.analyzePointer(f.getArgument(6));
   ASSERT_TRUE(succeeded(mappedBlock));
   EXPECT_EQ(mappedBlock->base, clone->getResult(2));
   for (auto field :
-       {mappedBlock->parentShape[0], mappedBlock->coordinateOffsets[0],
-        mappedBlock->strides[0]})
+       {mappedBlock->block->parentShape[0],
+        mappedBlock->block->coordinateOffsets[0],
+        mappedBlock->offsets.strides[0], mappedBlock->offsets.uniformOffset})
     EXPECT_EQ(cast<Value>(field), clone->getResult(1));
   EXPECT_TRUE(analysis.findCachedOffset(f.getArgument(2)));
   ASSERT_TRUE(analysis.findCachedBlockAdvanceDelta(next));
@@ -433,7 +436,7 @@ TEST(PointerAnalysisLifecycle, CloneEraseRemapsAllPublicFieldsAtomically) {
             clone->getResult(1));
   b.setInsertionPoint(f.getBody().front().getTerminator());
   ASSERT_TRUE(succeeded(buildAddressView(*mappedBlock, b, clone->getLoc())));
-  ASSERT_TRUE(succeeded(analysis.analyzeBlockPointer(next)));
+  ASSERT_TRUE(succeeded(analysis.analyzePointer(next)));
   EXPECT_TRUE(succeeded(verify(*module)));
 }
 
@@ -473,16 +476,15 @@ TEST(PointerAnalysisLifecycle,
     f.walk([&](triton::AddPtrOp op) { pointers.push_back(op); });
     Value twice = f.getBody().front().getTerminator()->getOperand(0);
     OpBuilder b(&context);
-    pointer_detail::AnalysisDriver<pointer_detail::BasicPointerRules> driver(
-        b, pointer_detail::BasicPointerRules({}));
+    pointer_detail::AnalysisDriver<pointer_detail::PointerRules> driver(
+        b, pointer_detail::PointerRules({}));
     if (sourceFirst) {
       ASSERT_TRUE(
           succeeded(driver.analyze({twice, pointer_detail::SourceInteger})));
       ASSERT_TRUE(succeeded(verify(*module)));
     }
     for (auto p : pointers) {
-      ASSERT_TRUE(
-          succeeded(driver.analyze({p, pointer_detail::OrdinaryPointer})));
+      ASSERT_TRUE(succeeded(driver.analyze({p, pointer_detail::PointerValue})));
       ASSERT_TRUE(succeeded(verify(*module)));
     }
     ASSERT_TRUE(
@@ -570,8 +572,8 @@ TEST(PointerAnalysisLifecycle,
       {f.getArgument(0), pointer_detail::FirstExtensionRequest})));
   EXPECT_TRUE(succeeded(
       driver.analyze({f.getArgument(0), pointer_detail::SourceInteger})));
-  EXPECT_TRUE(failed(
-      driver.analyze({f.getArgument(3), pointer_detail::OrdinaryPointer})));
+  EXPECT_TRUE(
+      failed(driver.analyze({f.getArgument(3), pointer_detail::PointerValue})));
   b.setInsertionPoint(root);
   IRMapping mapping;
   Operation *clone = b.clone(*root, mapping);
@@ -707,7 +709,9 @@ TEST(PointerAnalysisLifecycle, RankZeroExtractionIsPureAndCleanable) {
   EXPECT_TRUE(succeeded(verify(*module)));
 }
 
-template <typename Analysis> void checkAddressOptions(MLIRContext &context) {
+TEST(PointerAnalysisLifecycle, SessionRejectsUnsupportedAddressWidths) {
+  MLIRContext context;
+  context.loadDialect<arith::ArithDialect, triton::TritonDialect>();
   auto module = parseSourceString<ModuleOp>(R"mlir(
     module { tt.func @options(%base: !tt.ptr<i32>, %x: i32, %index: index) {
       %s = tt.splat %base : !tt.ptr<i32> -> tensor<4x!tt.ptr<i32>>
@@ -729,14 +733,14 @@ template <typename Analysis> void checkAddressOptions(MLIRContext &context) {
   auto make = *f.getBody().front().getOps<triton::MakeTensorPtrOp>().begin();
   auto advance = *f.getBody().front().getOps<triton::AdvanceOp>().begin();
   OpBuilder builder(&context);
-  BlockPointerAnalysis reference(builder);
+  PointerAnalysis reference(builder);
   auto pointer = reference.analyzePointer(base);
   ASSERT_TRUE(succeeded(pointer));
-  auto block = reference.analyzeBlockPointer(make);
+  auto block = reference.analyzePointer(make);
   ASSERT_TRUE(succeeded(block));
   for (unsigned addressWidth : {0u, 32u, 64u, 128u})
     for (unsigned indexWidth : {32u, 64u}) {
-      Analysis analysis(builder, {addressWidth, indexWidth});
+      PointerAnalysis analysis(builder, {addressWidth, indexWidth});
       const bool supported = addressWidth == 64;
       auto integer = analysis.analyzeOffset(x);
       ASSERT_TRUE(succeeded(integer));
@@ -757,39 +761,24 @@ template <typename Analysis> void checkAddressOptions(MLIRContext &context) {
       EXPECT_EQ(succeeded(analysis.analyzePointer(base)), supported);
       EXPECT_EQ(succeeded(analysis.analyzeAddressDelta(x)), supported);
       EXPECT_EQ(analysis.findCachedAddressDelta(x) != nullptr, supported);
-      if constexpr (std::is_same_v<Analysis, BlockPointerAnalysis>) {
-        EXPECT_EQ(succeeded(analysis.analyzeBlockPointer(make)), supported);
-        EXPECT_EQ(succeeded(analysis.analyzeBlockAdvanceDelta(advance)),
-                  supported);
-        EXPECT_EQ(succeeded(analysis.bindBlockPointer(make, *block)),
-                  supported);
-        if (!supported) {
-          EXPECT_EQ(analysis.findCachedOffset(x), saved);
-          EXPECT_EQ(analysis.findCachedOffset(f.getArgument(2)), savedIndex);
-        }
-        EXPECT_EQ(succeeded(analysis.analyzeBlockPointer(make)), supported);
-        EXPECT_EQ(succeeded(analysis.analyzeBlockPointer(advance)), supported);
-        EXPECT_EQ(analysis.findCachedBlockPointer(make) != nullptr, supported);
-        // A successful binding invalidates derived cache; query again first.
-        EXPECT_EQ(succeeded(analysis.analyzeBlockAdvanceDelta(advance)),
-                  supported);
-        EXPECT_EQ(analysis.findCachedBlockAdvanceDelta(advance) != nullptr,
-                  supported);
+      EXPECT_EQ(succeeded(analysis.analyzePointer(make)), supported);
+      EXPECT_EQ(succeeded(analysis.analyzeBlockAdvanceDelta(advance)),
+                supported);
+      EXPECT_EQ(succeeded(analysis.bindPointer(make, *block)), supported);
+      if (!supported) {
+        EXPECT_EQ(analysis.findCachedOffset(x), saved);
+        EXPECT_EQ(analysis.findCachedOffset(f.getArgument(2)), savedIndex);
       }
+      EXPECT_EQ(succeeded(analysis.analyzePointer(make)), supported);
+      EXPECT_EQ(succeeded(analysis.analyzePointer(advance)), supported);
+      EXPECT_EQ(analysis.findCachedPointer(make) != nullptr, supported);
+      // A successful binding invalidates derived cache; query again first.
+      EXPECT_EQ(succeeded(analysis.analyzeBlockAdvanceDelta(advance)),
+                supported);
+      EXPECT_EQ(analysis.findCachedBlockAdvanceDelta(advance) != nullptr,
+                supported);
       EXPECT_TRUE(succeeded(verify(*module)));
     }
-}
-
-TEST(PointerAnalysisLifecycle, BasicSessionRejectsUnsupportedAddressWidths) {
-  MLIRContext context;
-  context.loadDialect<arith::ArithDialect, triton::TritonDialect>();
-  checkAddressOptions<PointerAnalysis>(context);
-}
-
-TEST(PointerAnalysisLifecycle, BlockSessionRejectsUnsupportedAddressWidths) {
-  MLIRContext context;
-  context.loadDialect<arith::ArithDialect, triton::TritonDialect>();
-  checkAddressOptions<BlockPointerAnalysis>(context);
 }
 
 TEST(PointerAnalysisLifecycle, UnseenBindingsPreserveCompletedRequests) {
@@ -800,7 +789,8 @@ TEST(PointerAnalysisLifecycle, UnseenBindingsPreserveCompletedRequests) {
       %sum = arith.addi %x, %x : i64
       tt.return
     } }
-  )mlir", &context);
+  )mlir",
+                                            &context);
   ASSERT_TRUE(module);
   auto f = *module->getOps<triton::FuncOp>().begin();
   auto sum = *f.getBody().front().getOps<arith::AddIOp>().begin();

@@ -24,12 +24,11 @@ add_triton_library(TritonMemoryAccessAnalysis
   TritonMemoryAccessCore
 )
 
-# A consumer-independent numerical pointer decomposition. Both libraries are
-# delivered together, but the ordinary analysis does not depend on block or
-# conversion targets.
+# Consumer-independent numerical analysis for all Triton pointer forms.
 add_triton_library(TritonPointerAnalysis
   PointerArithmetic.cpp
   PointerAnalysisTransfer.cpp
+  BlockPointer.cpp
   PointerAnalysis.cpp
 
   LINK_LIBS PUBLIC
@@ -41,16 +40,4 @@ add_triton_library(TritonPointerAnalysis
   MLIRSupport
   TritonIR
   TritonMemoryAccessCore
-)
-
-add_triton_library(TritonBlockPointerAnalysis
-  BlockPointerAnalysis.cpp
-
-  LINK_LIBS PUBLIC
-  LLVMCore
-  MLIRArithDialect
-  MLIRIR
-  MLIRSupport
-  TritonIR
-  TritonPointerAnalysis
 )
