@@ -575,6 +575,10 @@ def test_compiler_dynamic_dot_row_launch(monkeypatch, taskqueue):
         out = torch.full((rows + 8, 16, 16), -777., device="npu")
         for c_entry in (False, True):
             out.fill_(-777.)
+            if not taskqueue:
+                # Direct CANN submission bypasses PyTorch's host queue. Finish
+                # input/sentinel initialization before testing the DotRow ABI.
+                torch.npu.synchronize()
             if c_entry:
                 _c_launch(instance, compiled, [
                     ctypes.c_void_p(a.data_ptr()),
