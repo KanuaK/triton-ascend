@@ -55,9 +55,12 @@ enum TritonNpuLaunchFlag {
   TRITON_NPU_DEVICE_PRINT = 1 << 7,
   // program_grid_transforms v2: IAT divides Y by 16; PTSM divides X by
   // 64 (alone) or 4 (with IAT), then caps X using physical_blocks.
-  // Either flag adds originalGridX/Y before the transformed device grid.
+  // Each dynamic mapping adds originalGridX/Y before the transformed grid.
   TRITON_NPU_IAT = 1 << 8,
   TRITON_NPU_PTSM = 1 << 9,
+  // DotRow divides X by coalesce_factor (2/4/8/16/32), with ceil division.
+  // It is mutually exclusive with IAT/PTSM and has no persistent X-axis cap.
+  TRITON_NPU_DOT_ROW = 1 << 10,
 };
 
 typedef struct {
@@ -76,6 +79,7 @@ typedef struct {
   int64_t lock_init_value;
   uint32_t participant_factor;
   uint32_t physical_blocks;
+  // Legacy coalescing or dynamic DotRow when TRITON_NPU_DOT_ROW is set.
   uint32_t coalesce_factor;
   int32_t coalesce_axis;
   uint32_t task_type;

@@ -7,15 +7,16 @@
 // Header-only probe: compare native grid lowering with the independent Python
 // program_grid reference without requiring a valid device binary or launch.
 int main(int argc, char **argv) {
-  if (argc != 6)
+  if (argc != 8)
     return 2;
   TritonNpuLaunchSpecV1 spec{};
   spec.version = 1;
   spec.struct_size = sizeof(spec);
   spec.flags = std::strtoull(argv[1], nullptr, 10);
   spec.physical_blocks = std::strtoul(argv[2], nullptr, 10);
-  spec.participant_factor = spec.coalesce_factor = spec.task_type = 1;
-  spec.coalesce_axis = -1;
+  spec.participant_factor = spec.task_type = 1;
+  spec.coalesce_factor = std::strtoul(argv[6], nullptr, 10);
+  spec.coalesce_axis = std::atoi(argv[7]);
   int32_t input[]{std::atoi(argv[3]), std::atoi(argv[4]), std::atoi(argv[5])};
   triton::ascend::validateSpec(spec);
   auto grid = triton::ascend::prepareGrid(spec, input);

@@ -112,7 +112,7 @@ struct ArgLayout {
       args.push_back(
           {i, kind, types[i].dtype, reserve(size, size == 8 ? 8 : 4), size});
     }
-    if (spec.flags & (TRITON_NPU_IAT | TRITON_NPU_PTSM))
+    if (spec.flags & (TRITON_NPU_IAT | TRITON_NPU_PTSM | TRITON_NPU_DOT_ROW))
       originalGrid = reserve(2 * sizeof(uint32_t), 4);
     grid = reserve(3 * sizeof(int32_t), 4);
     if (spec.flags & TRITON_NPU_PURE_SIMT) {
@@ -141,11 +141,17 @@ struct ArgLayout {
 inline void validateSpec(const TritonNpuLaunchSpecV1 &spec) {
   if (spec.version != 1 || spec.struct_size != sizeof(spec))
     throw std::invalid_argument("unsupported launcher spec ABI");
-  if (spec.flags & ~uint64_t(1023))
+  if (spec.flags & ~uint64_t(2047))
     throw std::invalid_argument("unknown launcher flags");
   if (!spec.coalesce_factor || spec.coalesce_axis < -1 ||
       spec.coalesce_axis > 2)
     throw std::invalid_argument("invalid launcher coalescing configuration");
+  if ((spec.flags & TRITON_NPU_DOT_ROW) &&
+      ((spec.flags & (TRITON_NPU_IAT | TRITON_NPU_PTSM)) ||
+       spec.coalesce_axis != 0 || !(spec.flags & TRITON_NPU_COALESCE_CEIL) ||
+       spec.coalesce_factor < 2 || spec.coalesce_factor > 32 ||
+       (spec.coalesce_factor & (spec.coalesce_factor - 1))))
+    throw std::invalid_argument("invalid dynamic DotRow configuration");
   if ((spec.flags & (TRITON_NPU_IAT | TRITON_NPU_PTSM)) &&
       (spec.coalesce_factor != 1 || spec.coalesce_axis != -1 ||
        (spec.flags & TRITON_NPU_COALESCE_CEIL)))

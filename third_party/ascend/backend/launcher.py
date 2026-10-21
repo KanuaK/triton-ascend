@@ -41,8 +41,8 @@ _LAUNCHER_CFLAGS = ("-O2", )
 # Keep these values in sync with launcher_abi.h. These are data tags, not C++
 # spellings: a signature is decoded once when a native plan is constructed.
 CONSTEXPR, POINTER, I8, I16, I32, I64, U8, U16, U32, U64, F32, F64 = range(12)
-FFTS, PURE_SIMT, TASKQUEUE, AUTO_MAP, GRID_WARNING, COALESCE_CEIL, DYNAMIC_SHARED, DEVICE_PRINT, IAT, PTSM = (
-    1 << i for i in range(10))
+FFTS, PURE_SIMT, TASKQUEUE, AUTO_MAP, GRID_WARNING, COALESCE_CEIL, DYNAMIC_SHARED, DEVICE_PRINT, IAT, PTSM, DOT_ROW = (
+    1 << i for i in range(11))
 
 _KINDS = {
     "constexpr": CONSTEXPR,
@@ -104,7 +104,7 @@ class LaunchSpec:
         return asdict(self)
 
 
-def _program_grid_flags(metadata):
+def _program_grid_config(metadata):
     # The compiler must explicitly report which rewriting and block-cap gates
     # applied. Missing fields must not silently select the legacy device ABI.
     for field in ("program_grid_mapping_applied", "row_coalescing_applied", "auto_blockify_enabled",
@@ -145,14 +145,16 @@ def _program_grid_flags(metadata):
     elif factor != 1 or axis != -1 or ceil_div:
         raise RuntimeError("unmatched RowCoalescing must retain default coalesce metadata")
     if transforms is None:
-        return 0
-    # Encode exactly the three version-2 sequences supported by the compiler.
-    # This extends the flag set without changing the version-1 C struct layout.
-    # Reject a future schema/sequence until its native implementation is added.
+        return COALESCE_CEIL if ceil_div else 0, factor, axis
+    # Encode the compiler's v2 sequences using the existing C spec fields.
+    # DOT_ROW uses X-axis ceil division like legacy coalescing, but also
+    # requires the originalGridX/Y hidden arguments of dynamic mappings.
     modes = {
-        ((1, 16, False, False), ): IAT,
-        ((1, 16, False, False), (0, 4, True, True)): IAT | PTSM,
-        ((0, 64, True, True), ): PTSM,
+        ((1, 16, False, False), ): (IAT, 1, -1),
+        ((1, 16, False, False), (0, 4, True, True)): (IAT | PTSM, 1, -1),
+        ((0, 64, True, True), ): (PTSM, 1, -1),
+        **{((0, factor, False, False), ): (DOT_ROW | COALESCE_CEIL, factor, 0)
+           for factor in (2, 4, 8, 16, 32)},
     }
     sequence = tuple((t["axis"], t["factor"], t["persistent_coverage"], t["grid_stride_abi_verified"])
                      for t in transforms["transforms"])
@@ -164,7 +166,7 @@ def _program_grid_flags(metadata):
 def make_launch_spec(metadata, npu_utils):
     """Translate compiler metadata without emitting native source code."""
     arch = metadata.target.arch
-    flags = _program_grid_flags(metadata)
+    flags, coalesce_factor, coalesce_axis = _program_grid_config(metadata)
     if utils.is_ffts_supported(arch) and not utils.force_disable_ffts(arch):
         flags |= FFTS
     if metadata.is_pure_simt:
@@ -179,8 +181,6 @@ def make_launch_spec(metadata, npu_utils):
         flags |= GRID_WARNING
     if _enabled("TRITON_DEVICE_PRINT"):
         flags |= DEVICE_PRINT
-    if getattr(metadata, "coalesce_grid_ceil_div", False):
-        flags |= COALESCE_CEIL
     enable_simt = "simt" in metadata.parallel_mode or metadata.is_pure_simt
     if metadata.compile_on_910_95 and enable_simt:
         flags |= DYNAMIC_SHARED
@@ -204,8 +204,8 @@ def make_launch_spec(metadata, npu_utils):
         lock_init_value=int(getattr(metadata, "lock_init_value", getattr(metadata, "lock_init_val", 0))),
         participant_factor=factor,
         physical_blocks=int(physical),
-        coalesce_factor=int(getattr(metadata, "coalesce_factor", 1) or 1),
-        coalesce_axis=int(getattr(metadata, "coalesce_axis", -1)),
+        coalesce_factor=coalesce_factor,
+        coalesce_axis=coalesce_axis,
         task_type=task_type,
         mix_ratio=mix_ratio,
         shared_mem_dynamic_size=int(getattr(metadata, "shared_mem_dynamic_size", 0)) if flags & DYNAMIC_SHARED else 0,

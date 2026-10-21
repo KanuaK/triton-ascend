@@ -321,3 +321,33 @@ def test_c_api_rejects_conflicting_program_grid_configuration(native_api, flags,
     handle = native_api.triton_npu_create_plan_v1(ct.byref(config), None, 0, error, len(error))
     assert not handle
     assert error.value
+
+
+@pytest.mark.parametrize("factor", [2, 4, 8, 16, 32])
+def test_c_api_accepts_dynamic_dot_row_configuration(native_api, factor):
+    with plan(native_api, [launcher.POINTER], flags=launcher.DOT_ROW | launcher.COALESCE_CEIL, coalesce_factor=factor,
+              coalesce_axis=0):
+        pass
+
+
+@pytest.mark.parametrize("changes", [
+    {"coalesce_factor": 1},
+    {"coalesce_factor": 3},
+    {"coalesce_factor": 64},
+    {"coalesce_axis": -1},
+    {"coalesce_axis": 1},
+    {"coalesce_axis": 2},
+    {"flags": launcher.DOT_ROW},
+    {"flags": launcher.DOT_ROW | launcher.COALESCE_CEIL | launcher.IAT},
+    {"flags": launcher.DOT_ROW | launcher.COALESCE_CEIL | launcher.PTSM},
+])
+def test_c_api_rejects_invalid_dynamic_dot_row_configuration(native_api, changes):
+    config = spec()
+    config.flags = launcher.DOT_ROW | launcher.COALESCE_CEIL
+    config.coalesce_factor, config.coalesce_axis = 8, 0
+    for field, value in changes.items():
+        setattr(config, field, value)
+    error = ct.create_string_buffer(256)
+    handle = native_api.triton_npu_create_plan_v1(ct.byref(config), None, 0, error, len(error))
+    assert not handle
+    assert b"invalid dynamic DotRow configuration" in error.value

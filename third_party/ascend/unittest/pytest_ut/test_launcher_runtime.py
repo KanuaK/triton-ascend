@@ -491,6 +491,7 @@ def _original_grid_echo(out, original_x, original_y):
     [(1, 16, False)],
     [(0, 64, True)],
     [(1, 16, False), (0, 4, True)],
+    *[[(0, factor, False)] for factor in (2, 4, 8, 16, 32)],
 ])
 def test_dynamic_original_grid_abi_reaches_both_entries(monkeypatch, taskqueue, sequence):
     from types import SimpleNamespace
@@ -528,3 +529,59 @@ def test_dynamic_original_grid_abi_reaches_both_entries(monkeypatch, taskqueue, 
         _c_launch(instance, compiled, [ctypes.c_void_p(output.data_ptr())], grid=grid)
         torch.npu.synchronize()
         assert output.cpu().tolist() == expected
+
+
+@triton.jit
+def _dynamic_dot_rows(a, b, out, steps):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, 16)[:, None] * 16 + tl.arange(0, 16)[None, :]
+    lhs = tl.load(a + row * 256 + offsets)
+    acc = tl.full((16, 16), 0, tl.float32)
+    for step in range(steps):
+        rhs = tl.load(b + step * 256 + offsets)
+        acc = tl.dot(lhs, rhs, acc)
+    tl.store(out + row * 256 + offsets, acc)
+
+
+@pytest.mark.parametrize("taskqueue", [False, True])
+def test_compiler_dynamic_dot_row_launch(monkeypatch, taskqueue):
+    from triton.backends.ascend.program_grid import normalize_program_grid_transforms
+    from triton.backends.ascend.utils import is_compile_on_910_95
+    if not is_compile_on_910_95(triton.runtime.driver.active.get_current_target().arch):
+        pytest.skip("compiler DotRow mapping requires Ascend 950")
+    monkeypatch.setenv("TRITON_ENABLE_TASKQUEUE", str(taskqueue))
+    # Compile without a static grid hint so the real compiler inserts the
+    # original-grid ABI and tail masks. No metadata or signatures are replaced.
+    compiled = triton.compile(
+        ASTSource(_dynamic_dot_rows, signature={"a": "*fp16", "b": "*fp16", "out": "*fp32", "steps": "i32"},
+                  constexprs={}), options={"rule_mask": 8})
+    assert compiled.metadata.program_grid_mapping_applied
+    assert not compiled.metadata.row_coalescing_applied
+    contract = normalize_program_grid_transforms(compiled.metadata.program_grid_transforms)
+    assert [(t["axis"], t["factor"], t["persistent_coverage"]) for t in contract["transforms"]] == [(0, 8, False)]
+    instance = _native(compiled)
+    steps = 3
+    b_cpu = (torch.arange(steps * 256).reshape(steps, 16, 16) % 5 - 2).float()
+    b = b_cpu.to(device="npu", dtype=torch.float16)
+    for rows in (1, 7, 8, 9, 65):
+        # Guard rows make an unmasked final group observable without writing
+        # outside the allocation. Small integer inputs have an exact reference.
+        a_cpu = (torch.arange((rows + 8) * 256).reshape(rows + 8, 16, 16) % 7 - 3).float()
+        a = a_cpu.to(device="npu", dtype=torch.float16)
+        expected = a_cpu[:rows] @ b_cpu.sum(0)
+        out = torch.full((rows + 8, 16, 16), -777., device="npu")
+        for c_entry in (False, True):
+            out.fill_(-777.)
+            if c_entry:
+                _c_launch(instance, compiled, [
+                    ctypes.c_void_p(a.data_ptr()),
+                    ctypes.c_void_p(b.data_ptr()),
+                    ctypes.c_void_p(out.data_ptr()),
+                    ctypes.c_int32(steps)
+                ], grid=(rows, 1, 1))
+            else:
+                _run(instance, compiled, (a, b, out, steps), grid=(rows, 1, 1))
+            torch.npu.synchronize()
+            actual = out.cpu()
+            assert torch.equal(actual[:rows], expected)
+            assert torch.all(actual[rows:] == -777.)

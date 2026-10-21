@@ -677,11 +677,26 @@ def _grid_contract(sequence):
         ])
 
 
-@pytest.mark.parametrize("sequence,expected", [
+_PROGRAM_GRID_CASES = [
     ([(1, 16, False)], launcher.IAT),
     ([(0, 64, True)], launcher.PTSM),
     ([(1, 16, False), (0, 4, True)], launcher.IAT | launcher.PTSM),
-])
+    *[([(0, factor, False)], launcher.DOT_ROW | launcher.COALESCE_CEIL) for factor in (2, 4, 8, 16, 32)],
+]
+
+
+def test_program_grid_sequence_coverage():
+    from triton.backends.ascend.program_grid import _SUPPORTED_SEQUENCES
+    # A new compiler contract must be covered by the launcher mapping and
+    # native grid/ABI checks below; do not silently leave a sequence untested.
+    assert {
+        tuple((axis, factor, persistent, persistent)
+              for axis, factor, persistent in sequence)
+        for sequence, _ in _PROGRAM_GRID_CASES
+    } == _SUPPORTED_SEQUENCES
+
+
+@pytest.mark.parametrize("sequence,expected", _PROGRAM_GRID_CASES)
 @pytest.mark.parametrize("as_json", [False, True])
 def test_program_grid_plan_modes(policy, sequence, expected, as_json):
     contract = _grid_contract(sequence)
@@ -689,9 +704,10 @@ def test_program_grid_plan_modes(policy, sequence, expected, as_json):
         metadata(program_grid_mapping_applied=True,
                  program_grid_transforms=json.dumps(contract) if as_json else contract,
                  ptsm_cap_authorized=any(t[2] for t in sequence)), policy)
-    assert spec.flags & (launcher.IAT | launcher.PTSM) == expected
+    assert spec.flags & (launcher.IAT | launcher.PTSM | launcher.DOT_ROW | launcher.COALESCE_CEIL) == expected
     assert not spec.flags & launcher.AUTO_MAP
-    assert (spec.coalesce_factor, spec.coalesce_axis) == (1, -1)
+    factor, axis = (sequence[0][1], 0) if expected & launcher.DOT_ROW else (1, -1)
+    assert (spec.coalesce_factor, spec.coalesce_axis) == (factor, axis)
 
 
 @pytest.mark.parametrize(
@@ -735,7 +751,7 @@ def test_program_grid_rejects_unsafe_mapping_combinations(policy, changes, error
 @pytest.mark.parametrize("blacklisted", [False, True])
 @pytest.mark.parametrize("auto_blockify", [False, True])
 @pytest.mark.parametrize("pure_simt", [False, True])
-@pytest.mark.parametrize("mapping", ["none", "row", "iat"])
+@pytest.mark.parametrize("mapping", ["none", "row", "iat", "dot_row"])
 def test_block_cap_follows_compiler_decision(policy, monkeypatch, auto_map, blacklisted, auto_blockify, pure_simt,
                                              mapping):
     # The runtime policy may differ from the one used to compile a cached
@@ -747,10 +763,13 @@ def test_block_cap_follows_compiler_decision(policy, monkeypatch, auto_map, blac
         fields.update(row_coalescing_applied=True, coalesce_factor=4, coalesce_axis=0, coalesce_grid_ceil_div=True)
     elif mapping == "iat":
         fields.update(program_grid_mapping_applied=True, program_grid_transforms=_grid_contract([(1, 16, False)]))
+    elif mapping == "dot_row":
+        fields.update(program_grid_mapping_applied=True, program_grid_transforms=_grid_contract([(0, 8, False)]))
     spec = launcher.make_launch_spec(metadata(**fields), policy)
     assert bool(spec.flags & launcher.AUTO_MAP) == auto_blockify
     assert bool(spec.flags & launcher.IAT) == (mapping == "iat")
-    assert bool(spec.flags & launcher.COALESCE_CEIL) == (mapping == "row")
+    assert bool(spec.flags & launcher.DOT_ROW) == (mapping == "dot_row")
+    assert bool(spec.flags & launcher.COALESCE_CEIL) == (mapping in ("row", "dot_row"))
     assert spec.physical_blocks == 40
 
 
@@ -769,17 +788,14 @@ def native_grid_probe(tmp_path_factory):
     return output
 
 
-@pytest.mark.parametrize("sequence,mode", [
-    ([(1, 16, False)], launcher.IAT),
-    ([(0, 64, True)], launcher.PTSM),
-    ([(1, 16, False), (0, 4, True)], launcher.IAT | launcher.PTSM),
-])
+@pytest.mark.parametrize("sequence,mode", _PROGRAM_GRID_CASES)
 @pytest.mark.parametrize("auto_map", [False, True])
 def test_native_grid_matches_compiler_reference(native_grid_probe, sequence, mode, auto_map):
     import random
     import subprocess
     from triton.backends.ascend.program_grid import apply_program_grid_transforms
     contract = _grid_contract(sequence)
+    factor, axis = (sequence[0][1], 0) if mode & launcher.DOT_ROW else (1, -1)
     rng = random.Random(2109)
     grids = [(1, 1, 1), (4097, 17, 3), (65, 33, 1), (2147483647, 1, 1)]
     grids += [tuple(rng.randint(1, n) for n in (32768, 128, 4)) for _ in range(32)]
@@ -787,9 +803,12 @@ def test_native_grid_matches_compiler_reference(native_grid_probe, sequence, mod
         for grid in grids:
             flags = mode | (launcher.AUTO_MAP if auto_map else 0)
             values = [
-                int(v)
-                for v in subprocess.check_output([str(
-                    native_grid_probe), str(flags), str(physical), *map(str, grid)], text=True).split()
+                int(v) for v in subprocess.check_output(
+                    [str(native_grid_probe),
+                     str(flags),
+                     str(physical), *map(str, grid),
+                     str(factor),
+                     str(axis)], text=True).split()
             ]
             expected = apply_program_grid_transforms(grid, contract, physical_core_count=physical)
             logical = expected[0] * expected[1] * expected[2]
@@ -797,7 +816,9 @@ def test_native_grid_matches_compiler_reference(native_grid_probe, sequence, mod
             # lock/workspace, pointer, i8, padding, original X/Y, final X/Y/Z,
             # padding, debug pointer: exact ABI offsets, independent of grid.
             assert values[5:] == [24, 28, 36, 48, 56]
-    values = subprocess.check_output([str(native_grid_probe), str(mode), "40", "0", "17", "3"], text=True)
+    values = subprocess.check_output(
+        [str(native_grid_probe), str(mode), "40", "0", "17", "3",
+         str(factor), str(axis)], text=True)
     assert list(map(int, values.split()))[:5] == [0, 17, 3, 0, 0]
 
 
