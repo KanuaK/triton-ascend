@@ -517,9 +517,12 @@ def test_dynamic_original_grid_abi_reaches_both_entries(monkeypatch, taskqueue, 
     instance = driver.NPULauncher(source, metadata)
     output = torch.full((5, ), -1, dtype=torch.int32, device="npu")
     # Reuse one plan and one exported stub for changing, non-divisible grids.
-    for grid in [(1, 1, 1), (4097, 17, 3), (129, 65, 1)]:
+    # Keep the largest transformed launch below legacy CANN's 65535-block
+    # limit: ceil(2049 / 2) * 17 * 3 == 52275 for DotRow factor=2.
+    for grid in [(1, 1, 1), (2049, 17, 3), (129, 65, 1)]:
         transformed = apply_program_grid_transforms(grid, contract,
                                                     physical_core_count=instance.launch_spec.physical_blocks)
+        assert transformed[0] * transformed[1] * transformed[2] <= 65535
         expected = [*grid[:2], *transformed]
         output.fill_(-1)
         _run(instance, compiled, (output, ), grid=grid)
